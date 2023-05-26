@@ -12,7 +12,7 @@ A discord bot built to interface with the [InvokeAI](https://github.com/invoke-a
 - RealESRGAN face fixing and upscaling
 - Slash commands
 - Per user credit tracking system
-- Credit recharging via Hive, HBD, or btc lightning payments
+- Credit recharging via Hive, HBD, Good Dollar or btc lightning payments
 - Free small credit topups for low balance users once every x hours (optional)
 - Filter blacklisted words from prompts (optional)
 - Upload to imgur api if files get too big for your discord server (optional)
