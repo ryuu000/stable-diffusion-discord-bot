@@ -13,7 +13,7 @@ const moment = require('moment')
 // const { ImgurClient } = require('imgur')
 // const imgur = new ImgurClient({ clientId: config.imgurClientID})
 // const imgbb = require("imgbb-uploader")
-//const DIG = require("discord-image-generation")
+// const { Rembg } = require("rembg-node")
 const sharp = require("sharp")
 const GIF = require("sharp-gif2")
 const Diff = require("diff")
@@ -27,7 +27,8 @@ var jimp = require('jimp')
 const FormData = require('form-data')
 const io = require("socket.io-client")
 const socket = io(config.apiUrl,{reconnect: true})
-var paused=false
+const ExifReader = require('exifreader')
+var paused=false // unused?
 var queue = []
 var users = []
 var payments = []
@@ -37,13 +38,13 @@ var schedule = []
 var dbScheduleFile='./dbSchedule.json' // flat file db for schedule
 dbScheduleRead()
 var cron = require('node-cron')
-// hive payment checks. On startup, every 30 minutes and on a !recharge call
+// hive payment checks. On startup, every 15 minutes and on a !recharge call
 const hive = require('@hiveio/hive-js')
 const { exit } = require('process')
 if(config.creditsDisabled==='true'){var creditsDisabled=true}else{var creditsDisabled=false}
 if(config.showFilename==='true'){var showFilename=true}else{var showFilename=false}
 if(config.hivePaymentAddress.length>0 && !creditsDisabled){
-  hive.config.set('alternative_api_endpoints',['https://api.hive.blog','https://api.deathwing.me','https://api.c0ff33a.uk','https://hived.emre.sh'])
+  hive.config.set('alternative_api_endpoints',['https://rpc.ausbit.dev','https://api.hive.blog','https://api.deathwing.me','https://api.c0ff33a.uk','https://hived.emre.sh'])
   var hiveUsd = 0.4
   var lastHiveUsd = hiveUsd
   getPrices()
@@ -52,7 +53,7 @@ if(config.hivePaymentAddress.length>0 && !creditsDisabled){
   cron.schedule('0 */12 * * *', () => { log('Recharging users with no credit every 12 hrs'.bgCyan.bold); freeRecharge() }) // Comment this out if you don't want free regular topups of low balance users
 }
 const bot = new Eris.CommandClient(config.discordBotKey, {
-  intents: ["guilds", "guildMessages", "messageContent", "guildMembers", "directMessages", "guildMessageReactions", "directMessageReactions"],
+  intents: ["guilds", "guildMessages", "messageContent", "directMessages", "guildMessageReactions", "directMessageReactions"],
   description: "Just a slave to the art, maaan",
   owner: "ausbitbank",
   prefix: "!",
@@ -66,12 +67,15 @@ const defaultScale = parseFloat(config.defaultScale)||7.5
 const defaultStrength = parseFloat(config.defaultStrength)||0.45
 const maxSteps = parseInt(config.maxSteps)||100
 const maxIterations = parseInt(config.maxIterations)||10
-const defaultMaxDiscordFileSize=parseInt(config.defaultMaxDiscordFileSize)||25000000  // TODO detect server boost status and increase this if boosted
+const defaultMaxDiscordFileSize=parseInt(config.defaultMaxDiscordFileSize)||25000000
 const basePath = config.basePath
 const maxAnimateImages = 100 // Only will fetch most recent X images for animating
+const allGalleryChannels = fs.existsSync('dbGalleryChannels.json') ? JSON.parse(fs.readFileSync('dbGalleryChannels.json', 'utf8')) : {}
+const allNSFWChannels = fs.existsSync('dbNSFWChannels.json') ? JSON.parse(fs.readFileSync('dbNSFWChannels.json', 'utf8')) : {}
 var rembg=config.rembg||'http://127.0.0.1:5000?url='
 var defaultModel=config.defaultModel||'stable-diffusion-1.5'
 var currentModel='notInitializedYet'
+var defaultModelInpaint=config.defaultModelInpaint||'inpainting'
 var models=null
 var lora=null
 var ti=null
@@ -80,11 +84,11 @@ var samplers=config.samplers.split(',')
 var samplersSlash=[]
 samplers.forEach((s)=>{samplersSlash.push({name: s, value: s})})
 var defaultSampler=samplers[0]
-debugLog('Enabled samplers:')
-debugLog(samplers)
+debugLog('Enabled samplers: '+samplers.join(','))
 debugLog('Default sampler:'+defaultSampler)
 var rendering = false
 var dialogs = {queue: null} // Track and replace our own messages to reduce spam
+var failedToPost=[]
 // load text files from txt directory, usable as {filename} in prompts, will return a random line from file
 var randoms=[]
 var randomsCache=[]
@@ -98,8 +102,7 @@ try{
         randomsCache.push(fs.readFileSync('txt/'+file,'utf-8').split(/r?\n/))
       }
     })
-    debugLog('Enabled randomisers:')
-    debugLog(randoms)
+    debugLog('Enabled randomisers: '+randoms.join(','))
   })
 }catch(err){log('Unable to read txt file directory'.bgRed);log(err)}
 if(randoms.includes('prompt')){randoms.splice(randoms.indexOf('prompt'),1);randoms.splice(0,0,'prompt')} // Prompt should be interpreted first
@@ -111,8 +114,8 @@ var slashCommands = [
     description: 'Create a new image from your prompt',
     options: [
       {type: 3, name: 'prompt', description: 'what would you like to see ?', required: true, min_length: 1, max_length:1500 },
-      {type: 4, name: 'width', description: 'width of the image in pixels (250-~1024)', required: false, min_value: 256, max_value: 1280 },
-      {type: 4, name: 'height', description: 'height of the image in pixels (250-~1024)', required: false, min_value: 256, max_value: 1280 },
+      {type: 4, name: 'width', description: 'width of the image in pixels (250-~1024)', required: false, min_value: 256, max_value: 2048 },
+      {type: 4, name: 'height', description: 'height of the image in pixels (250-~1024)', required: false, min_value: 256, max_value: 2048 },
       {type: 4, name: 'steps', description: 'how many steps to render for (10-250)', required: false, min_value: 5, max_value: 250 },
       {type: 4, name: 'seed', description: 'seed (initial noise pattern)', required: false},
       {type: 10, name: 'strength', description: 'how much noise to add to your template image (0.1-0.9)', required: false, min_value:0.01, max_value:0.99},
@@ -138,15 +141,14 @@ var slashCommands = [
       if (i.data.resolved && i.data.resolved.attachments && i.data.resolved.attachments.find(a=>a.contentType.startsWith('image/'))){
         var attachmentOrig=i.data.resolved.attachments.find(a=>a.contentType.startsWith('image/'))
         var attachment=[{width:attachmentOrig.width,height:attachmentOrig.height,size:attachmentOrig.size,proxy_url:attachmentOrig.proxyUrl,content_type:attachmentOrig.contentType,filename:attachmentOrig.filename,id:attachmentOrig.id}]
-      } else {
-        var attachment=[]
-      }
+      }else{var attachment=[]}
       // below allows for the different data structure in public interactions vs direct messages
-      if (i.member) {
+      request({cmd:getCmd(prepSlashCmd(i.data.options)),userid:i.member?i.member.id:i.user.id,username:i.member?i.member.user.username:i.user.username,discriminator:i.member?i.member.user.discriminator:i.user.discriminator,bot:i.member?i.member.user.bot:i.user.bot,channelid:i.channel.id,attachments:attachment})
+      /*if (i.member) {
         request({cmd: getCmd(prepSlashCmd(i.data.options)), userid: i.member.id, username: i.member.user.username, discriminator: i.member.user.discriminator, bot: i.member.user.bot, channelid: i.channel.id, attachments: attachment})
       } else if (i.user){
         request({cmd: getCmd(prepSlashCmd(i.data.options)), userid: i.user.id, username: i.user.username, discriminator: i.user.discriminator, bot: i.user.bot, channelid: i.channel.id, attachments: attachment})
-      }
+      }*/
     }
   },
   {
@@ -155,15 +157,8 @@ var slashCommands = [
     options: [ {type: 3, name: 'prompt', description: 'Add these keywords to a random prompt', required: false} ],
     cooldown: 500,
     execute: (i) => {
-      var prompt = ''
-      if (i.data.options) { prompt+= i.data.options[0].value + ' ' }
-      prompt += getRandom('prompt')
-      // below allows for the different data structure in public interactions vs direct messages
-      if (i.member){ // pubchan
-        request({cmd: prompt, userid: i.member.id, username: i.member.username, discriminator: i.member.discriminator, bot: i.member.bot, channelid: i.channel.id, attachments: []})
-      } else if (i.user) { // direct message
-        request({cmd: prompt, userid: i.user.id, username: i.user.username, discriminator: i.user.discriminator, bot: i.user.bot, channelid: i.channel.id, attachments: []})
-      }
+      var prompt=i.data.options?i.data.options[0].value+' '+getRandom('prompt'):getRandom('prompt')
+      request({cmd:prompt,userid:i.member?i.member.id:i.user.id,username:i.member?i.member.user.username:i.user.username,discriminator:i.member?i.member.user.discriminator:i.user.discriminator,bot:i.member?i.member.user.bot:i.user.bot,channelid:i.channel.id,attachments:[]})
     }
   },
   {
@@ -180,7 +175,57 @@ var slashCommands = [
         lexicaSearch(query,i.channel.id)
       }
     }
-  }
+  },
+  {
+    name: 'help',
+    description: 'Learn how to use this bot',
+    cooldown: 500,
+    execute: (i) => {
+      help(i.channel.id)
+    }
+  },
+  {
+    name: 'models',
+    description: 'See what models are currently available',
+    cooldown: 1000,
+    execute: (i) => {
+      listModels(i.channel.id)
+    }
+  },
+  {
+    name: 'embeds',
+    description: 'See what embeddings are currently available',
+    cooldown: 1000,
+    execute: (i) => {
+      listEmbeds(i.channel.id)
+    }
+  },
+  {
+    name: 'text',
+    description: 'Add text overlays to an image',
+    options: [
+      {type: 3, name: 'text', description: 'What to write on the image', required: true, min_length: 1, max_length:500 },
+      {type: 11, name: 'attachment', description: 'Image to add text to', required: true},
+      {type: 3, name: 'position', description: 'Where to position the text',required: false,value: 'south',choices: [{name:'centre',value:'centre'},{name:'north',value:'north'},{name:'northeast',value:'northeast'},{name:'east',value:'east'},{name:'southeast',value:'southeast'},{name:'south',value:'south'},{name:'southwest',value:'southwest'},{name:'west',value:'west'},{name:'northwest',value:'northwest'}]},
+      {type: 3, name: 'color', description: 'Text color (name or hex)', required: false, min_length: 1, max_length:50 },
+      {type: 3, name: 'blendmode', description: 'How to blend the text layer', required: false,value:'overlay',choices:[{name:'clear',value:'clear'},{name:'over',value:'over'},{name:'out',value:'out'},{name:'atop',value:'atop'},{name:'dest',value:'dest'},{name:'xor',value:'xor'},{name:'add',value:'add'},{name:'saturate',value:'saturate'},{name:'multiply',value:'multiply'},{name:'screen',value:'screen'},{name:'overlay',value:'overlay'},{name:'darken',value:'darken'},{name:'lighten',value:'lighten'},{name:'color-dodge',value:'color-dodge'},{name:'color-burn',value:'color-burn'},{name:'hard-light',value:'hard-light'},{name:'soft-light',value:'soft-light'},{name:'difference',value:'difference'},{name:'exclusion',value:'exclusion'}] }, // should be dropdown
+      {type: 3, name: 'width', description: 'How many pixels wide is the text?', required: false, min_length: 1, max_length:5 },
+      {type: 3, name: 'height', description: 'How many pixels high is the text?', required: false, min_length: 1, max_length:5 },
+      {type: 3, name: 'font', description: 'What font to use', required: false,value:'Arial',choices:[{name:'Arial',value:'Arial'},{name:'Comic Sans MS',value:'Comic Sans MS'},{name:'Tahoma',value:'Tahoma'},{name:'Times New Roman',value:'Times New Roman'},{name:'Verdana',value:'Verdana'},{name:'Lucida Console',value:'Lucida Console'}]},
+      {type: 5, name: 'extend', description: 'Extend the image?', required: false},
+      {type: 3, name: 'extendcolor', description: 'What color extension?', required: false, min_length: 1, max_length:10 },
+    ],
+    cooldown: 500,
+    execute: (i) => {
+      var ops=i.data.options
+      var {text='word',position='south',color='white',blendmode='difference',width=false,height=125,font='Arial',extend=false,extendcolor='black'}=ops.reduce((acc,o)=>{acc[o.name]=o.value;return acc}, {})
+      var userid=i.member ? i.member.id : i.user.id
+      if (i.data.resolved && i.data.resolved.attachments && i.data.resolved.attachments.find(a=>a.contentType.startsWith('image/'))){
+        var attachmentOrig=i.data.resolved.attachments.find(a=>a.contentType.startsWith('image/'))
+      }
+      textOverlay(attachmentOrig.proxyUrl,text,position,i.channel.id,userid,color,blendmode,parseInt(width)||false,parseInt(height),font,extend,extendcolor)
+    }
+  },
 ]
 // If credits are active, add /recharge otherwise don't include it
 if(!creditsDisabled)
@@ -193,8 +238,15 @@ if(!creditsDisabled)
   })
 }
 
-
 // Functions
+function auto2invoke(text) {
+  // convert auto1111 weight syntax to invokeai
+  // todo convert lora syntax eg <lora:add_detail:1> to withLora(add_detail,1)
+  const regex = /\(([^)]+):([^)]+)\)/g
+  return text.replaceAll(regex, function(match, $1, $2) {
+    return '('+$1+')' + $2
+  })
+}
 
 function request(request){
   // request = { cmd: string, userid: int, username: string, discriminator: int, bot: false, channelid: int, attachments: {}, }
@@ -204,8 +256,9 @@ function request(request){
   // let sanitize all the numbers first
   debugLog(args)
   for (n in [args.width,args.height,args.steps,args.seed,args.strength,args.scale,args.number,args.threshold,args.perlin]){
-    n=n.replace(/[^０-９\.]/g, '') // not affecting the actual args
+    n=n.replaceAll(/[^０-９\.]/g, '') // not affecting the actual args
   }
+  //args.width=(args.width&&Number.isInteger(args.width)&&args.width<256)?args.width:defaultSize
   if (!args.width||!Number.isInteger(args.width)||args.width<256){args.width=defaultSize}
   if (!args.height||!Number.isInteger(args.height)||args.height<256){args.height=defaultSize}
   if ((args.width*args.height)>config.pixelLimit) { // too big, try to compromise, find aspect ratio and use max resolution of same ratio
@@ -243,6 +296,7 @@ function request(request){
   args.timestamp=moment()
   args.prompt=sanitize(args._.join(' '))
   if (args.prompt.length===0){args.prompt=getRandom('prompt');log('empty prompt found, adding random')}
+  args.prompt = auto2invoke(args.prompt)
   var newJob={
     id: queue.length+1,
     status: 'new',
@@ -365,8 +419,8 @@ function getRandomSeed(){return Math.floor(Math.random()*4294967295)}
 function chat(msg){if(msg!==null&&msg!==''){try{bot.createMessage(config.channelID, msg)}catch(err){log(err)}}}
 function chatChan(channel,msg){if(msg!==null&&msg!==''){try{bot.createMessage(channel, msg)}catch(err){log('Failed to send with error:'.bgRed);log(err)}}}
 function sanitize(prompt){
-  if(config.bannedWords.length>0){config.bannedWords.split(',').forEach((bannedWord,index)=>{prompt=prompt.replace(bannedWord,'')})}
-  return prompt.replace(/[^一-龠ぁ-ゔァ-ヴーa-zA-Z0-9_ａ-ｚＡ-Ｚ０-９々〆〤ヶ+()=!\"\&\*\[\]<>\\\/\- ,.\:]/g, '').replace('`','') // (/[^一-龠ぁ-ゔァ-ヴーa-zA-Z0-9_ａ-ｚＡ-Ｚ０-９々〆〤ヶ()\*\[\] ,.\:]/g, '')
+  if(config.bannedWords.length>0){config.bannedWords.split(',').forEach((bannedWord,index)=>{prompt=prompt.replaceAll(bannedWord,'')})}
+  return prompt.replaceAll(/[^一-龠ぁ-ゔァ-ヴーa-zA-Z0-9_ａ-ｚＡ-Ｚ０-９々〆〤ヶ+()=!\"\&\*\[\]<>\\\/\- ,.\:\u0023-\u0039\u200D\u20E3\u2194-\u2199\u21A9-\u21AA\u231A-\u231B\u23E9-\u23EC\u23F0\u23F3\u25AA-\u25AB\u25B6\u25C0\u25FB-\u25FE\u2600-\u2604\u260E\u2611\u2614-\u2615\u261D\u263A\u2648-\u2653\u2660\u2663\u2665-\u2666\u2668\u267B\u267F\u2693\u26A0-\u26A1\u26AA-\u26AB\u26BD-\u26BE\u26C4-\u26C5\u26CE\u26D1\u26D3-\u26D4\u26E9\u26F0-\u26F5\u26F7-\u26FA\u26FD\u2702\u2705\u2708-\u270D\u270F\u2712\u2714\u2716\u271D\u2721\u2733-\u2734\u2744\u2747\u274C-\u274D\u274E\u2753-\u2755\u2757\u2763-\u2764\u2795-\u2797\u27A1\u27B0\u27BF\u2934-\u2935\u2B05-\u2B07\u2B1B-\u2B1C\u2B50\u2B55\u3030\u303D\u3297\u3299àáâãäåçèéêëìíîïñòóôõöøùúûüýÿ\u00A0\uFEFF]/g, '').replaceAll('`','')
 }
 function base64Encode(file){var body=fs.readFileSync(file);return body.toString('base64')}
 function authorised(who,channel,guild) {
@@ -388,7 +442,6 @@ function authorised(who,channel,guild) {
   } else { return true }
 }
 function createNewUser(id){
-  log('createnewuser called with id',id)
   if(id.id){id=id.id}
   users.push({id:id, credits:100}) // 100 creds for new users
   dbWrite() // Sync after new user
@@ -400,8 +453,8 @@ function userCreditCheck(userID,amount) { // Check if a user can afford a specif
   if(parseFloat(user.credits)>=parseFloat(amount)||creditsDisabled){return true}else{return false}
 }
 function costCalculator(job) {                 // Pass in a render, get a cost in credits
+  if(creditsDisabled){return 0}                // Bypass if credits system is disabled
   var cost=1                                   // a normal render base cost, 512x512 30 steps
-  //var pixelBase=262144                       // 512x512 reference pixel size
   var pixelBase=defaultSize*defaultSize        // reference pixel size
   var pixels=job.width*job.height              // How many pixels does this render use?
   cost=(pixels/pixelBase)*cost                 // premium or discount for resolution relative to default
@@ -411,29 +464,34 @@ function costCalculator(job) {                 // Pass in a render, get a cost i
   if (job.upscale_level===2){cost=cost*1.5}    // 1.5x charge for upscale 2x (increased processing+storage+bandwidth)
   if (job.upscale_level===4){cost=cost*2}      // 2x charge for upscale 4x
   if (job.hires_fix===true){cost=cost*1.5}     // 1.5x charge for hires_fix (renders once at half resolution, then again at full)
-  if (job.channel!==config.channelID){cost=cost*1.1}// 10% charge for renders outside of home channel
+  //if (job.channel!==config.channelID){cost=cost*1.1}// 10% charge for renders outside of home channel
   cost=cost*job.number                         // Multiply by image count
-  if(creditsDisabled){return 0} else {return cost.toFixed(2)} // Return cost to 2 decimal places if credits enabled
+  return cost.toFixed(2)                       // Return cost to 2 decimal places
 }
 function creditsRemaining(userID){return users.find(x=>x.id===userID).credits}
 function chargeCredits(userID,amount){
   if(!creditsDisabled){
     var user=users.find(x=>x.id===userID)
-    user.credits=(user.credits-amount).toFixed(2)
-    dbWrite()
-    var z='charged id '+userID+' - '+amount+'/'
-    if(user.credits>90){z+=user.credits.bgBrightGreen.white}else if(user.credits>50){z+=user.credits.bgGreen.black}else if(user.credits>10){z+=user.credits.bgBlack.white}else{z+=user.credits.bgRed.white}
-    log(z.dim.bold)
+    if (user){
+      user.credits=(user.credits-amount).toFixed(2)
+      dbWrite()
+      var z='charged id '+userID+' - '+amount.toFixed(2)+'/'
+      if(user.credits>90){z+=user.credits.bgBrightGreen.black}else if(user.credits>50){z+=user.credits.bgGreen.black}else if(user.credits>10){z+=user.credits.bgBlack.white}else{z+=user.credits.bgRed.white}
+      log(z.dim.bold)
+    } else {
+      log('Unable to find user: '+userID)
+    }
   }
 }
-function creditRecharge(credits,txid,userid,amount,from){
+async function creditRecharge(credits,txid,userid,amount,from){
   var user=users.find(x=>x.id===userid)
-  if(!user){createNewUser(userid)}
+  if(!user){await createNewUser(userid);var user=users.find(x=>x.id===userid)}
   if(user&&user.credits){user.credits=(parseFloat(user.credits)+parseFloat(credits)).toFixed(2)}
   if(txid!=='manual'){
     payments.push({credits:credits,txid:txid,userid:userid,amount:amount})
     var paymentMessage = ':tada: <@'+userid+'> added :coin:`'+credits+'`, balance is now :coin:`'+user.credits+'`\n:heart_on_fire: Thanks `'+from+'` for the `'+amount+'` donation to the GPU fund.\n Type !recharge to get your own topup info'
     chat(paymentMessage)
+    directMessageUser(config.adminID,paymentMessage)
   }
   dbWrite()
 }
@@ -456,12 +514,26 @@ function freeRecharge(){
     log('No users eligible for free credit recharge')
   }
 }
-function dbWrite(){
+/*function dbWrite(){
   try{
     fs.writeFileSync('dbQueue.json',JSON.stringify({queue:queue}))
     fs.writeFileSync('dbUsers.json',JSON.stringify({users:users}))
     fs.writeFileSync('dbPayments.json',JSON.stringify({payments:payments}))
-  }catch(err){log('Failed to write db files'.bgRed);log(err)}}
+  }catch(err){log('Failed to write db files'.bgRed);log(err)}}*/
+function dbWrite() {
+  const files = [{name:'dbQueue.json',data:{queue:queue}},{name:'dbUsers.json',data:{users:users}},{name:'dbPayments.json',data:{payments:payments}}]
+  files.forEach((file) => {
+    const dataExists = fs.existsSync(file.name)
+    const dataIsDifferent = dataExists && JSON.stringify(file.data) !== fs.readFileSync(file.name, 'utf8')
+    if(dataIsDifferent){
+      try{
+        fs.writeFileSync(`${file.name}.tmp.json`, JSON.stringify(file.data))
+        fs.renameSync(`${file.name}.tmp.json`, file.name)
+      }catch(err){log('Failed to write db files'.bgRed);log(err)}
+    }
+  })
+}
+
 function dbRead() {
   try{
     queue=JSON.parse(fs.readFileSync('dbQueue.json')).queue
@@ -502,17 +574,16 @@ function scheduleInit(){
 }
 function getUser(id){var user=bot.users.get(id);log(user);if(user){return user}else{return null}}
 function getUsername(id){var user=getUser(id);if(user!==null&&user.username){return user.username}else{return null}}
-function getRichList(){
-  var u=users.filter(u=>parseInt(u.credits)>100).sort((a,b)=>b.credits-a.credits)
-  var richlistMsg='Rich List\n'
-  u.forEach(u=>{richlistMsg+=getUsername(u.id)+':coin:`'+u.credits+'`\n'})
-  log(richlistMsg)
-}
-function getPrices () { // TODO fallback to getting costs from hive internal market
+function getPrices () {
   var url='https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=hive&order=market_cap_asc&per_page=1&page=1&sparkline=false'
   axios.get(url)
     .then((response)=>{hiveUsd=response.data[0].current_price;lastHiveUsd=hiveUsd;log('HIVE: $'+hiveUsd)})
-    .catch(()=>{log('Failed to load data from coingecko api'.red.bold);hiveUsd=lastHiveUsd})
+    .catch(()=>{
+      log('Failed to load data from coingecko api, trying internal market'.red.bold)
+      axios.post('https://rpc.ausbit.dev/', {id: 1,jsonrpc: '2.0',method: 'condenser_api.get_ticker',params: []})
+        .then((hresponse)=>{hiveUsd=parseFloat(hresponse.data.result.latest);log('HIVE (internal market): $'+hiveUsd)})
+        .catch((err)=>{log('Failed to load data from hive market api');log(err);hiveUsd=lastHiveUsd})
+    })
 }
 function getLightningInvoiceQr(memo){
   var appname=config.hivePaymentAddress+'_discord' // TODO should this be an .env variable?
@@ -536,18 +607,37 @@ function rechargePrompt(userid,channel){
   var paymentLinkHbd='https://hivesigner.com/sign/transfer?to='+config.hivePaymentAddress+'&amount=1.000%20HBD&memo='+paymentMemo
   var paymentLinkHive='https://hivesigner.com/sign/transfer?to='+config.hivePaymentAddress+'&amount=1.000%20HIVE&memo='+paymentMemo
   var lightningInvoiceQr=getLightningInvoiceQr(paymentMemo)
-  var paymentMsg='<@'+userid+'> has :coin:`'+creditsRemaining(userid)+'` left\n\n*Recharging costs `1` usd per :coin:`500` *\nSend HBD or HIVE to `'+config.hivePaymentAddress+'` with the memo `'+paymentMemo+'`\n**Pay $1 with Hbd:** '+paymentLinkHbd+'\n**Pay $1 with Hive:** '+paymentLinkHive
-  var freeRechargeMsg='..Or just wait for your free recharge of 10 credits twice a day'
-  var paymentMsgObject={content: paymentMsg,embeds:[{description:'Pay $1 via btc lightning network', image:{url:lightningInvoiceQr}}]}
-  if (creditsRemaining(userid)<10){paymentMsgObject.embeds.push({footer:{text:freeRechargeMsg}})}
+  var paymentMsg=''
+  paymentMsg+='<@'+userid+'> you have `'+creditsRemaining(userid)+'` :coin: remaining\n*The rate is `1` **USD** per `500` :coin: *\n'
+  paymentMsg+= 'You can send any amount of HIVE <:hive:1110123056501887007> or HBD <:hbd:1110282940686016643> to `'+config.hivePaymentAddress+'` with the memo `'+paymentMemo+'` to top up your balance\n'
+  //paymentMsg+= '**Pay 1 HBD:** '+paymentLinkHbd+'\n**Pay 1 HIVE:** '+paymentLinkHive
+  var freeRechargeMsg='..Or just wait for your FREE recharge of 10 credits twice daily'
+  var rechargeImages=['https://media.discordapp.net/attachments/1024766656347652186/1110852592864595988/237568213750251520-1684918295766-text.png','https://media.discordapp.net/attachments/1024766656347652186/1110862401420677231/237568213750251520-1684920634773-text.png','https://media.discordapp.net/attachments/1024766656347652186/1110865969645105213/237568213750251520-1684921485321-text.png','https://media.discordapp.net/attachments/968822563662860338/1110869028475523174/237568213750251520-1684922214077-text.png','https://media.discordapp.net/attachments/1024766656347652186/1110872463736324106/237568213750251520-1684923032433-text.png','https://media.discordapp.net/attachments/1024766656347652186/1110875096106676256/237568213750251520-1684923660927-text.png','https://media.discordapp.net/attachments/1024766656347652186/1110876051694952498/237568213750251520-1684923889116-text.png','https://media.discordapp.net/attachments/1024766656347652186/1110877696726159370/237568213750251520-1684924281507-text.png','https://media.discordapp.net/attachments/968822563662860338/1110904225384382554/merged_canvas.da2c2db8.png']
+  shuffle(rechargeImages)
+  var paymentMsgObject={
+    content: paymentMsg,
+    embeds:
+    [
+      {image:{url:rechargeImages[0]}},
+      {description:'Pay $1 via btc lightning network', image:{url:lightningInvoiceQr}},
+      {footer:{text:freeRechargeMsg}}
+    ],
+    components: [
+      {type: Constants.ComponentTypes.ACTION_ROW, components:[
+        {type: 2, style: 5, label: "SEND 1 HIVE", url:paymentLinkHive, emoji: { name: 'hive', id: '1110123056501887007'}, disabled: false },
+        {type: 2, style: 5, label: "SEND 1 HBD", url:paymentLinkHbd, emoji: { name: 'hbd', id: '1110282940686016643'}, disabled: false },
+        //{type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.SECONDARY, label: "Bitcoin over Lightning", custom_id: "rechargeLightning", emoji: { name: '⚡', id: null}, disabled: false }
+      ]}
+    ]
+  }
   directMessageUser(userid,paymentMsgObject,channel).catch((err)=>log(err))
   log('ID '+userid+' asked for recharge link')
 }
-function checkNewPayments(){
+async function checkNewPayments(){
+  // Hive native payments support
   var bitmask=['4','524288'] // transfers and fill_recurrent_transfer only
-  var accHistoryLength=config.accHistoryLength||100
+  var accHistoryLength=config.accHistoryLength||100 // default 100
   log('Checking recent payments for '.grey+config.hivePaymentAddress.grey)
-  // TODO there has to be a more efficient method, revisit below
   hive.api.getAccountHistory(config.hivePaymentAddress, -1, accHistoryLength, ...bitmask, function(err, result) {
     if(err){log(err)}
     if(Array.isArray(result)) {
@@ -563,13 +653,38 @@ function checkNewPayments(){
             coin=op.amount.split(' ')[1]
             amount=parseFloat(op.amount.split(' ')[0])
             if(coin==='HBD'){amountCredit=amount*500}else if(coin==='HIVE'){amountCredit=(amount*hiveUsd)*500}
-            log('New Payment: amount credit:'.bgBrightGreen.red+amountCredit+' , amount:'+op.amount)
+            log('New Payment! credits:'.bgBrightGreen.red+amountCredit+' , amount:'+op.amount)
             creditRecharge(amountCredit,tx.trx_id,accountId,op.amount,op.from)
           }
         }
       })
     } else {log('error fetching account history'.bgRed)}
   })
+  // Hive-Engine payments support
+  if(config.allowHiveEnginePayments){
+    var allowedHETokens=['SWAP.HBD','SWAP.HIVE']
+    response = await axios.get('https://history.hive-engine.com/accountHistory?account='+config.hivePaymentAddress+'&limit='+accHistoryLength+'&offset=0&ops=tokens_transfer')
+    var HEtransactions=response.data
+    var HEbotPayments=HEtransactions.filter(t=>t.to===config.hivePaymentAddress&&allowedHETokens.includes(t.symbol)&&t.memo?.startsWith(config.hivePaymentPrefix))
+    HEbotPayments.forEach(t=>{
+      var pastPayment=payments.find(tx=>tx.txid===t.transactionId)
+      var usdValue=0
+      var userid=parseInt(t.memo.split('-')[1])
+      if(pastPayment===undefined&&isInteger(userid)){ // not in db yet, memo looks correct
+        switch(t.symbol){ // todo get market price for other tokens, keeping it simple for now
+          case 'SWAP.HIVE': usdValue=parseFloat(t.quantity)*(hiveUsd*0.9925);break // treat like regular HIVE - 0.75% HE withdraw fee
+          case 'SWAP.HBD': usdValue=parseFloat(t.quantity)*0.9925;break // treat like regular HBD and peg to $1 - 0.75% HE withdraw fee
+          default: usdValue=0;break // shouldn't happen, just in case
+        }
+        var credits=usdValue*500
+        log('New Payment! credits:'.bgBrightGreen.red+credits+' , amount:'+t.quantity+' '+t.symbol+' , from: '+t.from)
+        creditRecharge(credits,t.transactionId,userid,t.quantity+' '+t.symbol,t.from)
+      }
+    })
+  }
+  // todo tip.cc payments
+  if(config.allowTipccPayments){
+  }
 }
 checkNewPayments=debounce(checkNewPayments,30000,true) // at least 30 seconds between checks
 function sendWebhook(job){ // TODO eris has its own internal webhook method, investigate and maybe replace this
@@ -589,39 +704,20 @@ function postprocessingResult(data){ // TODO unfinished, untested, awaiting new 
 function requestModelChange(newmodel){log('Requesting model change to '+newmodel);if(newmodel===undefined||newmodel==='undefined'){newmodel=defaultModel}socket.emit('requestModelChange',newmodel,()=>{log('requestModelChange loaded')})}
 function cancelRenders(){log('Cancelling current render'.bgRed);socket.emit('cancel');queue[queue.findIndex((q)=>q.status==='rendering')-1].status='cancelled';rendering=false}
 function generationResult(data){
-  //log('generation result')
-  //log(data)
   var url=data.url
   url=config.basePath+data.url.split('/')[data.url.split('/').length-1]
   var job=queue[queue.findIndex(j=>j.status==='rendering')] // TODO there has to be a better way to know if this is a job from the web interface or the discord bot // upcoming invokeai api release solves this
-  // todo detect all-black image result using jimp
-  /*try{
-    var img=jimp.read(data.url)
-    if(img){
-      log('loaded image from generationResult')
-      var p1=img.intToRGBA(img.getPixelColor(0,0))
-      var p2=img.intToRGBA(img.getPixelColor(img.bitmap.width/2,img.bitmap.height/2))
-      var p3=img.intToRGBA(img.getPixelColor(img.bitmap.width,img.bitmap.height))
-      log(p1,p2,p3)
-      if(p1===p2&&p2===p3){log('3 pixels match color, warn');data.warning=true}
-    }
-  }catch(err){log(err)}*/
   if(job){
     var postRenderObject={id:job.id,filename: url, seed: data.metadata.image.seed, resultNumber:job.results.length, width:data.metadata.image.width,height:data.metadata.image.height}
     // remove redundant data before pushing to db results
     delete (data.metadata.prompt);delete (data.metadata.seed);delete (data.metadata.model_list);delete (data.metadata.app_id);delete (data.metadata.app_version); delete (data.attentionMaps)
     job.results.push(data)
-    /*if(data.tokens){
-      debugLog('Tokens: ' + data.tokens.length)
-      debugLog(data.tokens)
-    }*/
     postRender(postRenderObject)
   }else{rendering=false}
-  if(job&&job.results.length>=job.number){job.status='done';rendering=false;processQueue()}
-  if(dialogs.queue!==null){dialogs.queue.delete().catch((err)=>{}).then(()=>{dialogs.queue=null;intermediateImage=null})}//;queueStatusLock=false
+  if(job&&job.results.length>=job.number){job.status='done';dbWrite();rendering=false;processQueue()}// else {debugLog('Not marking job done, waiting for more images')}
+  if(dialogs.queue!==null){dialogs.queue.delete().catch((err)=>{}).then(()=>{dialogs.queue=null;intermediateImage=null})}
 }
 function initialImageUploaded(data){
-  var url=data.url
   var filename=config.basePath+"/"+data.url.replace('outputs/','')
   var id=data.url.split('/')[data.url.split('/').length-1].split('.')[0]
   var job=queue[id-1]
@@ -677,7 +773,8 @@ async function emitRenderApi(job){
     if(key!==undefined){log('Missing property for '+key);if(key==='codeformer_strength'){upscale.strength=0}} // not undefined in this context means there is a key that IS undefined, confusing
   })
   socket.emit('generateImage',postObject,upscale,facefix)
-  debugLog('sent request',postObject,upscale,facefix)
+  dbWrite() // can we gracefully recover if we restart right after sending the request to backend?
+  //debugLog('sent request',postObject,upscale,facefix)
 }
 function getObjKey(obj, value){return Object.keys(obj).find(key=>obj[key]===value)}
 async function addRenderApi(id){
@@ -752,7 +849,7 @@ async function postRender(render){
         msg+=':coin:`'+(job.cost/job.number).toFixed(2).replace(/[.,]00$/, "")+'/'+ creditsRemaining(job.userid) +'`'
       }
       var newMessage = { content: msg, embeds: [{description: job.prompt, color: getRandomColorDec()}], components: [ { type: Constants.ComponentTypes.ACTION_ROW, components: [ ] } ] }
-      if(job.prompt.replace(' ','').length===0){newMessage.embeds=[]}
+      if(job.prompt.replaceAll(' ','').length===0){newMessage.embeds=[]}
       newMessage.components[0].components.push({ type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.SECONDARY, label: "ReDream", custom_id: "refresh-" + job.id, emoji: { name: '🎲', id: null}, disabled: false })
       newMessage.components[0].components.push({ type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.SECONDARY, label: "Edit Prompt", custom_id: "edit-"+job.id, emoji: { name: '✏️', id: null}, disabled: false })
       newMessage.components[0].components.push({ type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.SECONDARY, label: "Tweak", custom_id: "tweak-"+job.id+'-'+render.resultNumber, emoji: { name: '🧪', id: null}, disabled: false })
@@ -760,44 +857,38 @@ async function postRender(render){
       if(newMessage.components[0].components.length===0){delete newMessage.components} // If no components are used there will be a discord api error so remove it
       var filesize=fs.statSync(render.filename).size
       if(filesize<defaultMaxDiscordFileSize){ // Within discord 25mb filesize limit
-        try{bot.createMessage(job.channel, newMessage, {file: data, name: filename + '.png'}).then(m=>{}).catch((err)=>{log('caught error posting to discord in channel '.bgRed+job.channel);log(err)})}
-        catch(err){console.error(err)}
-      } else {
-        log('Image '+filename+' was too big for discord, failed to post to channel '+job.channel)
-      }
-      // Disabled imgur and imgbb uploads (discord limits raised, no longer required + TOS changes for imgur make it awkward)
-      /*}else{
-        if(imgurEnabled()&&filesize<10000000){
-          bot.createMessage(job.channel,'<@'+job.userid + '> your image was too big for discord, uploading to imgur now..')
-          try { imgurupload(render.filename).then(upload => { bot.createMessage(job.channel,{ content: msg, embeds: [{image: {url: upload.link}, description:job.prompt}]}) }) }
-          catch (err) { console.error(err); bot.createMessage(job.channel,'Sorry <@' + job.userid + '> imgur uploading failed, contact an admin for your image `' + filename + '.png`') }
-        // disabled imgbb as it was unreliable
-        /*} else if (imgbbEnabled() && filesize < 32000000) {
-          chat('<@' + job.userid + '> your file was too big for discord, uploading to imgbb now..')
-          try { imgbbupload(render.filename).then(upload => { log(upload); bot.createMessage(job.channel,{ content: msg, embeds: [{image: {url: upload.url}, description:job.prompt}]}) }) }
-          catch (err) { console.error(err); bot.createMessage(job.channel,'Sorry <@' + job.userid + '> imgbb uploading failed, contact an admin for your image `' + filename + '.png`') }*/
-        /*} else {
-          try {
-            bot.createMessage(job.channel,'<@' + job.userid + '> your image was too big for discord and imgur, uploading to oshi.at now..')
-            log('uploading via oshi.at api')
-            log(render.filename)
-            let form = new FormData()
-            const fileStream = fs.createReadStream(render.filename)
-            form.append("file", fileStream)
-            axios({method:'post',url:'https://oshi.at/',data:form,'maxContentLength': Infinity,'maxBodyLength': Infinity,headers:{...form.getHeaders()}})
-            .then((response)=>{
-              var oshiimg=response.data.split('DL: ')[1]
-              bot.createMessage(job.channel,{ content: msg+'\n '+(filesize/1000000).toFixed(2)+'MB image uploaded to oshi.at : '+oshiimg, embeds: [{description:job.prompt, color: getRandomColorDec()}]})
+        try{
+          bot.createMessage(job.channel, newMessage, {file: data, name: filename + '.png'})
+            .then(m=>{debugLog('Posted msg id '+m.id+' to channel id '+m.channel.id)}) // maybe wait till successful post here to change job status? Could store msg id to job
+            .catch((err)=>{
+              log('caught error posting to discord in channel '.bgRed+job.channel)
+              log(err)
+              failedToPost.push({channel:job.channel,msg:newMessage,file:data,name:filename+'.png'})
             })
-            .catch((error) => console.error(error))
-          }catch (err){console.error(err);bot.createMessage(job.channel,'Sorry <@' + job.userid + '> but your image was too big for all available image hosts, contact an admin for your image `' + filename + '.png`')} 
-        }
-      }*/
+        }catch(err){console.error(err)}
+      }else{
+        log('Image '+filename+' was too big for discord, failed to post to channel '+job.channel)
+        failedToPost.push({channel:job.channel,msg:newMessage,file:data,name:filename+'.png'})
       }
-    })
-  }
-  catch(err) {console.error(err)}
+    }
+  })
+  }catch(err){log(err)}
 }
+
+async function repostFails(){ // bugged ? sometimes failing to repost in channels where new posts work fine // DiscordRestError [50001]: Missing Access
+  debugLog('Attempting to repost '+failedToPost.length+' failed message')
+  failedToPost.forEach((p)=>{
+    try{
+      bot.createMessage(p.channel,p.msg,{file:p.file,name:p.filename})
+        .then(m=>{debugLog('successfully reposted failed image');failedToPost=failedToPost.filter(f=>{f.file!==p.file})}) // remove successful posts
+        .catch(err=>{
+          log('Unable to repost to channel '+p.channel)
+          log(err)
+        })
+    }catch(err){log(err)}
+  })
+}
+
 function processQueue(){
   // WIP attempt to make a harder to dominate queue
   // TODO make a queueing system that prioritizes the users that have recharged the most
@@ -809,9 +900,12 @@ function processQueue(){
   }else{var nextJob=queue[queue.findIndex(x=>x.status==='new')]}
   if(nextJob&&!rendering){
     if(userCreditCheck(nextJob.userid,costCalculator(nextJob))){
-      bot.editStatus('online')
+      busyStatusArr=[{type:0,name:' with paint for '+queueNew.length}]
+      shuffle(busyStatusArr)
+      //var statusMsg = 'with '+queueNew.length+' artful idea';if(queueNew.length>1){statusMsg+='s'}
+      bot.editStatus('online',{type: busyStatusArr[0].type,name:busyStatusArr[0].name})
       rendering=true
-      log(nextJob.username.bgWhite.red+':'+nextJob.cmd.replace('\r','').replace('\n').bgWhite.black)
+      log(nextJob.username.bgWhite.red+':'+nextJob.cmd.replaceAll('\r','').replaceAll('\n').bgWhite.black)
       addRenderApi(nextJob.id)
     }else{
       log(nextJob.username+' cant afford this render, denying')
@@ -827,10 +921,19 @@ function processQueue(){
     if(renderJobErrors.length>0){
       log('These job statuses are set to rendering, but rendering=false - this shouldnt happen'.bgRed)
       log(renderJobErrors)
-      renderJobErrors.forEach((j)=>{if(j.status==='rendering'){log('setting status to failed for id '+j.id);j.status='failed'}})
+      renderJobErrors.forEach((j)=>{if(j.status==='rendering'){log('setting status to failed for id '+j.id);j.status='failed';dbWrite()}})
     }
+    if(failedToPost.length>0){repostFails()}
     debugLog('Finished queue, setting idle status'.dim)
-    bot.editStatus('idle')
+    idleStatusArr=[ // alternate idle messages
+    // 0=playing? 1=Playing 2=listening to 3=watching 5=competing in
+      {type:5,name:'meditation'},
+      {type:3,name:'disturbing dreams'},
+      {type:2,name:'your thoughts'},
+      {type:0,name:'the waiting game'}
+    ]
+    shuffle(idleStatusArr)
+    bot.editStatus('idle',idleStatusArr[0])
   }
 }
 function lexicaSearch(query,channel){
@@ -845,12 +948,108 @@ function lexicaSearch(query,channel){
       log('Lexica search for :`'+query+'` gave '+r.data.images.length+' results, '+filteredResults.length+' after filtering')
       shuffle(filteredResults)
       filteredResults=filteredResults.slice(0,10)// shuffle and trim to 10 results // todo make this an option once lexica writes api docs
-      filteredResults.forEach(i=>{reply.embeds.push({color: getRandomColorDec(),description: ':seedling:`'+i.seed+'` :straight_ruler:`'+i.width+'x'+i.height+'`',image:{url:i.srcSmall},footer:{text:i.prompt}})})
+      filteredResults.forEach(i=>{reply.embeds.push({color: getRandomColorDec(),description: '',image:{url:i.srcSmall},footer:{text:i.prompt}})})
       try{bot.createMessage(channel, reply)}catch(err){debugLog(err)}
     })
     .catch((error) => console.error(error))
 }
 lexicaSearch=debounce(lexicaSearch,1000,true)
+
+async function textOverlay(imageurl,text,gravity='south',channel,user,color='white',blendmode='difference',width=false,height=125,font='Arial',extendimage=false,extendcolor='black'){
+  // todo caption area as a percentage of image size
+  try{
+    var image=(await axios({ url: imageurl, responseType: "arraybuffer" })).data
+    var res=await sharp(image)
+    if(extendimage){
+      switch(gravity){
+        case 'south':
+        case 'southeast':
+        case 'southwest': {res.extend({bottom:height,background:extendcolor});break}
+        case 'north':
+        case 'northeast':
+        case 'northwest': {res.extend({top:height,background:extendcolor});break}
+      }
+      res = sharp(await res.toBuffer()) // metadata will give wrong height value after our extend, reload it. Not too expensive
+    }
+    var metadata = await res.metadata()
+    if(!width){width=metadata.width-10}
+    const overlay = await sharp({text: {text: '<span foreground="'+color+'">'+text+'</span>',rgba: true,width: width,height: height,font: font}}).png().toBuffer()
+    res = await res.composite([{ input: overlay, gravity: gravity, blend: blendmode }]) // Combine the text overlay with original image
+    var buffer = await res.toBuffer()
+    bot.createMessage(channel, '<@'+user+'> added **text**: `'+text+'`\n**position**: '+gravity+', **color**:'+color+', **blendmode**:'+blendmode+', **width**:'+width+', **height**:'+height+', **font**:'+font+', **extendimage**:'+extendimage+', **extendcolor**:'+extendcolor, {file: buffer, name: user+'-'+new Date().getTime()+'-text.png'})
+  }catch(err){log(err)}
+}
+
+async function removeBackground(url,channel,user){
+// js implementation of python rembg lib, degrades quality, needs more testing
+//  var image=(await axios({ url: url, responseType: "arraybuffer" })).data
+//  image = sharp(image)
+//  const remBg = new Rembg({logging: false})
+//  var remBgOutput = await remBg.remove(image)
+//  var buffer = await remBgOutput.png().toBuffer()
+
+// original rembg python/docker version
+// requires docker run -p 127.0.0.1:5000:5000 danielgatis/rembg s
+  var buffer = await axios.get(rembg+encodeURIComponent(url),{responseType: 'arraybuffer'})
+  buffer = Buffer.from(buffer.data)
+  var newMsg='<@'+user+'> removed background'
+  if(!creditsDisabled){newMsg+=' , it cost `0.05`:coin:';chargeCredits(user,0.05)}
+  bot.createMessage(channel, newMsg, {file: buffer, name: user+'-bg.png'})
+}
+
+async function rotate(imageurl,degrees=90,channel,user){
+  try{
+    var image=(await axios({ url: imageurl, responseType: "arraybuffer" })).data
+    var res=await sharp(image)
+    res.rotate(degrees)
+    var buffer = await res.png().toBuffer()
+    bot.createMessage(channel, '<@'+user+'> rotated image `'+degrees+'` degrees', {file: buffer, name: user+'-'+new Date().getTime()+'-rotate.png'})
+  }catch(err){log(err)}
+}
+
+async function help(channel){
+  var helpMsgObject={
+  content: 'To create art:\n`!dream your idea here` or `/dream`\nSee these links for more info',
+  components: [
+    {type: Constants.ComponentTypes.ACTION_ROW, components:[
+      {type: 2, style: 5, label: "Intro Post", url:'https://peakd.com/@ausbitbank/our-new-stable-diffusion-discord-bot', emoji: { name: 'hive', id: '1110123056501887007'}, disabled: false },
+      {type: 2, style: 5, label: "Github", url:'https://github.com/ausbitbank/stable-diffusion-discord-bot', emoji: { name: 'Github', id: '1110915942856282112'}, disabled: false },
+      {type: 2, style: 5, label: "Commands", url:'https://github.com/ausbitbank/stable-diffusion-discord-bot/blob/main/commands.md', emoji: { name: 'Book_Accessibility', id: '1110916595863269447'}, disabled: false },
+      {type: 2, style: 5, label: "Invite to server", url:'https://github.com/ausbitbank/stable-diffusion-discord-bot/blob/main/commands.md', emoji: { name: 'happy_pepe', id: '1110493880304013382'}, disabled: false },
+      {type: 2, style: 5, label: "Privacy Policy", url:'https://gist.github.com/ausbitbank/cd8ba9ea6aa09253fcdcdfad36b9bcdd', emoji: { name: '📜', id: null}, disabled: false },
+    ]}
+  ] 
+  }
+  bot.createMessage(channel, helpMsgObject)
+}
+
+async function listModels(channel){ // list available models
+  if(!models){await socket.emit('requestSystemConfig')}
+  var newMsg=''
+  if(models){
+    newMsg='**'+Object.keys(models).length+' models available**\n:green_circle: =loaded in VRAM :orange_circle: =cached in RAM :red_circle: = unloaded\n'
+    Object.keys(models).forEach((m)=>{
+      switch(models[m].status){
+        case 'not loaded':{newMsg+=':red_circle:';break}
+        case 'cached':{newMsg+=':orange_circle:';break}
+        case 'active':{newMsg+=':green_circle:';break}
+      }
+      newMsg+='`'+m+'`  '
+      newMsg+=models[m].description+'\n'
+      if(newMsg.length>=1500){try{chatChan(channel,newMsg);newMsg=''}catch(err){log(err)}}
+    })
+    if(newMsg!==''){try{chatChan(channel,newMsg)}catch(err){log(err)}}
+  }
+}
+
+async function listEmbeds(channel){ // list available embeds
+  socket.emit("getLoraModels")
+  socket.emit("getTextualInversionTriggers")
+  newMsg=':pill: Embeddings are a way to supplement the current model. Add them to the prompt.\n'
+  if(lora&&lora.length>0){newMsg+='**LORA**:\nwithLora(loraname,weight)\n'+lora.join(' , ')+'\n'} // map(x=>`withLora(${x})`)
+  if(ti&&ti.length>0){newMsg=newMsg+'**Textual inversions**:\n'+ti.join(' , ')+'\n Everything in https://huggingface.co/sd-concepts-library is also available'} // ti.map(x=>`\<${x}\>`)
+  sliceMsg(newMsg).forEach((m)=>{try{bot.createMessage(channel, m)}catch(err){debugLog(err)}})
+}
 
 async function meme(prompt,urls,userid,channel){
   params = prompt.split(' ')
@@ -860,6 +1059,9 @@ async function meme(prompt,urls,userid,channel){
     case 'blur':{var image=await jimp.read(urls[0]);image.blur(10);img=await image.getBufferAsync(jimp.MIME_PNG);break}
     case 'greyscale':{var image=await jimp.read(urls[0]);image.greyscale();img=await image.getBufferAsync(jimp.MIME_PNG);break}
     case 'invert':{var image=await jimp.read(urls[0]);image.invert();img=await image.getBufferAsync(jimp.MIME_PNG);break}
+    case 'flip':{var image=await jimp.read(urls[0]);image.flip(false,true);img=await image.getBufferAsync(jimp.MIME_PNG);break}
+    case 'mirror':{var image=await jimp.read(urls[0]);image.flip(true,false);img=await image.getBufferAsync(jimp.MIME_PNG);break}
+    case 'rotate':{var image=await jimp.read(urls[0]);var rotatedeg=parseInt(prompt.split(' ')[1])||90;image.rotate(rotatedeg);img=await image.getBufferAsync(jimp.MIME_PNG);break}
     case 'animateseed':{
       if(params.length<2){return} // bugfix crash on animateseed with no seed
       //debugLog('Seed match count:' + queue.filter((j)=>j.seed==params[1]).length)
@@ -879,7 +1081,8 @@ async function meme(prompt,urls,userid,channel){
           if (stopUrl == fileOnly) {donemark=true} // this is the last one
           var seedUrl = config.basePath+fileOnly // TODO: Review OS compat path operations
           urlseed.push(seedUrl)
-          promptseed.push(r.metadata.image.prompt[0].prompt)
+          //promptseed.push(r.metadata.image.prompt[0].prompt) // broken original
+          promptseed.push(r.metadata.image.prompt) // invoke metadata format changed since initial implementation
         })
       })
       if (urlseed.length>1) // At least two images to work with
@@ -887,17 +1090,22 @@ async function meme(prompt,urls,userid,channel){
         let styledprompts = [promptseed[0]] // prefill first prompt
         for (var i = 1; i < promptseed.length;i++) // start on second prompt
         {
-          const diff = Diff.diffWords(promptseed[i - 1], promptseed[i]) // Find differences between previous prompt and this one, Chunks into unchanged/added/removed
-          var updateprompt = ""
-          diff.forEach((part) => { // Bring all chunks back together with styling based on type
-            if (part.added) {updateprompt += "<span foreground='green'><b><big>" + part.value + "</big></b></span>"}
-            else if (part.removed) {updateprompt += "<span foreground='red'><s>" + part.value + "</s></span>"}
-            else {updateprompt += part.value}
-          })
-          styledprompts.push(updateprompt)      	
+          try{
+            const diff = Diff.diffWords(promptseed[i - 1], promptseed[i]) // Find differences between previous prompt and this one, Chunks into unchanged/added/removed
+            var updateprompt = ""
+            diff.forEach((part) => { // Bring all chunks back together with styling based on type
+              var pv = part.value.replaceAll('&','').replaceAll('<',' ').replaceAll('>',' ') //.replaceAll('[','').replaceAll(']','') // Remove textual inversion brackets before adding markup
+              // todo still failing on prompts with [<neg-sketch-3>] due to invalid markup
+              if (part.added) {updateprompt += "<span foreground='green'><b><big>" + pv + "</big></b></span>"}
+              else if (part.removed) {updateprompt += "<span foreground='red'><s>" + pv + "</s></span>"}
+              else {updateprompt += pv}
+            })
+            styledprompts.push(updateprompt)
+          }catch(err){log(err)}
         }
         // TODO: Better finisher ideas? Repeating last prompt in blue to signify the end
-        styledprompts.push("<span foreground='blue'>" + promptseed[promptseed.length - 1] + "</span>")
+        styledprompts.push("<span foreground='blue'>" + promptseed[promptseed.length-1] + "</span>")
+        debugLog(styledprompts)
         urlseed.push(urlseed[urlseed.length - 1])
       	let frameList = []
       	for (var i = 0;i < urlseed.length;i++)
@@ -908,24 +1116,21 @@ async function meme(prompt,urls,userid,channel){
           // Create styled prompt text overlay
           // TODO: Some height padding would be nice. Not as easy as width padding cuz of alignment
           // WARN: Had no issue with font, but read about extra steps sometimes being necessary
-          styledprompts[i]=styledprompts[i].replace('&','') // stop crash from invalid markup
-          const overlay = await sharp({
-              text: {
-                  text: styledprompts[i],
-                  rgba: true,
-                  width: metadata.width - 20,
-                  height: 200, 
-                  font: 'Arial',
-              },
-          }).png().toBuffer()
-          res = await res.composite([{ input: overlay, gravity: 'south' }]) // Combine the prompt overlay with prompt image
-          frameList.push(res)
+          if(sanitizedprompt){
+            try{
+              const overlay = await sharp({text: {text: promptseed[promptseed.length-1],rgba: true,width: metadata.width - 20,height: 200,font: 'Arial',}}).png().toBuffer()
+              res = await res.composite([{ input: overlay, gravity: 'south' }]) // Combine the prompt overlay with prompt image
+              frameList.push(res)
+            }catch(err){log(err)}
+          }
       	}
         // rgb444 format is way faster, slightly worse quality
         // default takes almost a minute for 15 frames, versus a handful of seconds
         // Does makes background a bit off-white sometimes
-      	var image = await GIF.createGif({delay:delay, format:"rgb444"}).addFrame(frameList).toSharp()
-      	img = await image.toBuffer()
+        try{
+          var image = await GIF.createGif({delay:delay, format:"rgb444"}).addFrame(frameList).toSharp()
+          img = await image.toBuffer()
+        }catch(err){log(err)}
       }
       break
     }
@@ -943,37 +1148,7 @@ async function meme(prompt,urls,userid,channel){
       break
     }
     /*
-    case 'gay': var img = await new DIG.Gay().getImage(urls[0]);break
     case 'sepia': var img = await new DIG.Sepia().getImage(urls[0]);break
-    case 'triggered': var img = await new DIG.Triggered().getImage(urls[0]);break
-    case 'ad': var img = await new DIG.Ad().getImage(urls[0]);break
-    case 'affect': var img = await new DIG.Affect().getImage(urls[0]);break
-    case 'batslap': {if (urls.length==2){var img = await new DIG.Batslap().getImage(urls[0],urls[1])};break} // Take 2 images
-    case 'beautiful': var img = await new DIG.Beautiful().getImage(urls[0]);break
-    case 'bed': {if (urls.length==2){var img = await new DIG.Bed().getImage(urls[0],urls[1])};break} // takes 2 images
-    case 'bobross': var img = await new DIG.Bobross().getImage(urls[0]);break
-    case 'confusedstonk': var img = await new DIG.ConfusedStonk().getImage(urls[0]);break
-    case 'delete': var img = await new DIG.Delete().getImage(urls[0]);break
-    case 'discordblack': var img = await new DIG.DiscordBlack().getImage(urls[0]);break
-    case 'discordblue': var img = await new DIG.DiscordBlue().getImage(urls[0]);break
-    case 'doublestonk': {if (urls.length==2){var img = await new DIG.DoubleStonk().getImage(urls[0],urls[1])};break} // takes 2 images
-    case 'facepalm': var img = await new DIG.Facepalm().getImage(urls[0]);break
-    case 'hitler': var img = await new DIG.Hitler().getImage(urls[0]);break
-    case 'jail': var img = await new DIG.Jail().getImage(urls[0]);break
-    case 'karaba': var img = await new DIG.Karaba().getImage(urls[0]);break
-    case 'kiss': {if (urls.length==2){var img = await new DIG.Kiss().getImage(urls[0],urls[1])};break} // takes 2 images
-    case 'lisapresentation': var img = await new DIG.LisaPresentation().getImage(prompt.replace('lisapresentation ',''));break // takes text
-    case 'mms': var img = await new DIG.Mms().getImage(urls[0]);break
-    case 'notstonk': var img = await new DIG.NotStonk().getImage(urls[0]);break
-    case 'podium': {if (urls.length==3&&params[1]&&params[2]&&params[3]){var img = await new DIG.Podium().getImage(urls[0],urls[1],urls[2],params[1],params[2],params[3])};break} // new DIG.Podium().getImage(`<Avatar1>, <Avatar2>, <Avatar2>, <Name1>, <Name2>, <Name3>`)
-    case 'poutine': var img = await new DIG.Poutine().getImage(urls[0]);break
-    case 'rip': var img = await new DIG.Rip().getImage(urls[0]);break
-    case 'spank': {if (urls.length==2){var img = await new DIG.Spank().getImage(urls[0],urls[1])};break} // takes 2 urls
-    case 'stonk': var img = await new DIG.Stonk().getImage(urls[0]);break
-    case 'tatoo': var img = await new DIG.Tatoo().getImage(urls[0]);break
-    case 'thomas': var img = await new DIG.Thomas().getImage(urls[0]);break
-    case 'trash': var img = await new DIG.Trash().getImage(urls[0]);break
-    case 'wanted': {if (urls.length==1){var img = await new DIG.Wanted().getImage(urls[0], '$')};break} // takes image + currency sign, hardcoding $
     case 'circle': var img = await new DIG.Circle().getImage(urls[0]);break
     case 'color': var img = await new DIG.Color().getImage(params[1]);break // take hex color code*/
   }
@@ -1030,21 +1205,7 @@ function replaceRandoms(input){
   })
   return output
 }
-/*
-function imgurEnabled(){if(config.imgurClientID.length>0){return true}else{return false}}
-async function imgurupload(file) {
-  log('uploading via imgur api')
-  const response = await imgur.upload({ image: fs.createReadStream(file), type: 'stream'})
-  debugLog(response.data)
-  return response.data
-}
-function imgbbEnabled(){if(config.imgbbClientID.length>0){return true}else{return false}}
-async function imgbbupload(file) {
-  log('uploading via imgbb api')
-  imgbb(config.imgbbClientID, file)
-    .then((response)=>{debugLog(response);return response})
-    .catch((error)=>console.error(error))
-} */
+
 function partialMatches(strings, search) {
   let results = []
   for(let i=0;i<strings.length;i++){
@@ -1059,6 +1220,25 @@ function searchString(str, searchTerm) {
   let searchTermLowerCase = searchTerm.toLowerCase() 
   let strLowerCase = str.toLowerCase() 
   return strLowerCase.includes(searchTermLowerCase) 
+}
+
+async function metaDataMsg(imageurl,channel){
+  debugLog('attempting metadata extraction from '+imageurl)
+  try{var metadata = await ExifReader.load(imageurl)
+  }catch(err){log(err)}
+  var newMsg='Metadata for '+imageurl+' \n'
+  Object.keys(metadata).forEach((t)=>{
+    newMsg+='**'+t+'**:'
+    Object.keys(metadata[t]).forEach((k)=>{
+      if(k==='description'&&metadata[t][k]===metadata[t]['value']){
+      } else {
+        if(k==='value'){newMsg+='`'+metadata[t][k]+'`'}
+        if(k==='description'){newMsg+=' *'+metadata[t][k]+'*'}
+      }
+    })
+    newMsg+='\n'
+  })
+  if(newMsg.length>0&&newMsg.length<10000){sliceMsg(newMsg).forEach((m)=>{try{bot.createMessage(channel, m)}catch(err){debugLog(err)}})} else {debugLog('Aborting metadata message, response too long')}
 }
 
 function process (file){// Monitor new files entering watchFolder, post image with filename.
@@ -1078,14 +1258,23 @@ if(config.filewatcher==="true") {
   const renders=chokidar.watch(config.watchFolder, {persistent: true,ignoreInitial: true,usePolling: false,awaitWriteFinish:{stabilityThreshold: 500,pollInterval: 500}})
   renders.on('add',file=>{process(file)})
 }
-function tidyNumber (x) {if (x) {var parts = x.toString().split('.');parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ',');return parts.join('.')}else{return null}}
+function tidyNumber (x) {if (x) {var parts = x.toString().split('.');parts[0] = parts[0].replaceAll(/\B(?=(\d{3})+(?!\d))/g, ',');return parts.join('.')}else{return null}}
 function sliceMsg(str) {
   const chunkSize=1999 // max discord message is 2k characters
   let chunks=[];let i=0;let len=str.length
   while (i < len) {chunks.push(str.slice(i, i += chunkSize))}
   return chunks
 }
-
+async function clearParent(interaction){
+  var label=':saluting_face: **'+interaction.data.custom_id.split('-')[0].replace('twk','')+'** selected'
+  try{
+    if(interaction.message&&interaction.message.flags===64){// ephemeral message that cannot be deleted by us, only edited
+      try{return await interaction.editParent({content: label,components: [],embeds:[]}).then(()=>{}).catch(e=>{if(e){}})}catch(err){log(err)}
+    } else if (interaction.message) { // regular message reference
+      try{await interaction.createMessage({content:label,flags:64}).then(()=>{}).catch(e=>{if(e){}})}catch(err){log(err)}
+    }
+  }catch(err){log(err)}
+}
 // Initial discord bot setup and listeners
 bot.on("ready", async () => {
   log("Connected to discord".bgGreen)
@@ -1109,117 +1298,115 @@ bot.on("interactionCreate", async (interaction) => {
   if(interaction instanceof Eris.CommandInteraction && authorised(interaction,interaction.channel.id,interaction.guildID)) {//&& interaction.channel.id === config.channelID
     if (!bot.commands.has(interaction.data.name)) return interaction.createMessage({content:'Command does not exist', flags:64}).catch((e) => {log('command does not exist'.bgRed);log(e)})
     try {
-      bot.commands.get(interaction.data.name).execute(interaction)
-      interaction.acknowledge().then(x=> {interaction.deleteMessage('@original').then((t) => {}).catch((e) => {log('error after delete interaction'.bgRed);console.error(e)}) }).catch((e)=>{console.error(e)})
+      await interaction.acknowledge().then(()=>{
+        //debugLog('ack '+interaction.data.name)
+        bot.commands.get(interaction.data.name).execute(interaction)
+        interaction.deleteMessage('@original').then(()=>{}).catch((e)=>log(e))
+      }).catch((err)=>log(err))
     }
     catch (error) { console.error(error); await interaction.createMessage({content:'There was an error while executing this command!', flags: 64}).catch((e) => {log(e)}) }
   }
   if((interaction instanceof Eris.ComponentInteraction||interaction instanceof Eris.ModalSubmitInteraction)&&authorised(interaction,interaction.channel.id,interaction.guildID)) {
-    if(!interaction.member){log(interaction.user.username+' slid into artys DMs');interaction.member={user:{id: interaction.user.id,username:interaction.user.username,discriminator:interaction.user.discriminator,bot:interaction.user.bot}}}
-    log(interaction.data.custom_id.bgCyan.black+' request from '+interaction.member.user.username.bgCyan.black)
-    if(interaction.data.custom_id.startsWith('random')){
+    if(!interaction.member){interaction.member={user:{id: interaction.user.id,username:interaction.user.username,discriminator:interaction.user.discriminator,bot:interaction.user.bot}}}
+    var cid=interaction.data.custom_id 
+    var id=cid.split('-')[1]
+    var rn=cid.split('-')[2]
+    log(cid.bgCyan.black+' request from '+interaction.member.user.username.bgCyan.black)
+    if(queue.length>=(id-1)){var newJob=JSON.parse(JSON.stringify(queue[id-1]))} // parse/stringify to deep copy and make sure we dont edit the original}
+    if(newJob){
+      newJob.number=1
+      if(newJob.webhook){delete newJob.webhook}
+      var result=newJob.results[rn]
+      if(result&&result.metadata.image&&result.metadata.image.seed){newJob.seed=result.metadata.image.seed}
+      newJob.results=[]
+    }
+    if(cid.startsWith('random')){
       request({cmd: getRandom('prompt'), userid: interaction.member.user.id, username: interaction.member.user.username, discriminator: interaction.member.user.discriminator, bot: interaction.member.user.bot, channelid: interaction.channel.id, attachments: []})
-      return interaction.editParent({}).catch((e)=>{log(e)})
-    }else if(interaction.data.custom_id.startsWith('refresh')){
-      var id=interaction.data.custom_id.split('-')[1]
-      if(queue.length>=(id-1)){var newJob=JSON.parse(JSON.stringify(queue[id-1]))} // parse/stringify to deep copy and make sure we dont edit the original}
+      return clearParent(interaction) //return interaction.editParent({}).catch((e)=>{log(e)})
+    }else if(cid.startsWith('refresh')){
+      try{await interaction.deferUpdate()}catch(err){log(err)}
       if(newJob) {
-        newJob.number=1
-        if (newJob.webhook){delete newJob.webhook}
-        if (interaction.data.custom_id.startsWith('refreshVariants')&&newJob.sampler!=='k_euler_a') { // variants do not work with k_euler_a sampler
+        if (cid.startsWith('refreshVariants')&&newJob.sampler!=='k_euler_a') { // variants do not work with k_euler_a sampler
           newJob.variation_amount=0.1
-          newJob.seed = interaction.data.custom_id.split('-')[2]
-          var variantseed = interaction.data.custom_id.split('-')[3]
+          newJob.seed = cid.split('-')[2]
+          var variantseed = cid.split('-')[3]
           if (variantseed){ // variant of a variant
             newJob.with_variations = [[parseInt(variantseed),0.1]]
             log(newJob.with_variations)
           }
-        } else if (interaction.data.custom_id.startsWith('refreshUpscale-')) {
+        } else if (cid.startsWith('refreshUpscale-')) {
           newJob.upscale_level = 2
-          newJob.seed = interaction.data.custom_id.split('-')[2]
+          newJob.seed = cid.split('-')[2]
           newJob.variation_amount=0
-        } else if (interaction.data.custom_id.startsWith('refreshEdit-')){
+        } else if (cid.startsWith('refreshEdit-')){
           newJob.prompt=interaction.data.components[0].components[0].value
         } else { // Only a normal refresh should change the seed
           newJob.variation_amount=0
           newJob.seed=getRandomSeed()
         }
-        //if (interaction.data.custom_id.startsWith('refreshEdit-')){newJob.prompt=interaction.data.components[0].components[0].value}
         request({cmd: getCmd(newJob), userid: interaction.member.user.id, username: interaction.member.user.username, discriminator: interaction.member.user.discriminator, bot: interaction.member.user.bot, channelid: interaction.channel.id, attachments: newJob.attachments})
-        if (interaction.data.custom_id.startsWith('refreshEdit-')){return interaction.editParent({}).catch((e)=>{console.error(e)})}else{return interaction.editParent({}).catch((e)=>{console.error(e)})}
+        //if (cid.startsWith('refreshEdit-')){return clearParent(interaction)}
+        return clearParent(interaction)
       } else {
         log('unable to refresh render'.bgRed)
-        return interaction.editParent({components:[]}).catch((e) => {console.error(e)})
+        return clearParent(interaction)
       }
-    } else if (interaction.data.custom_id.startsWith('editRandom-')) {
-      id=interaction.data.custom_id.split('-')[1]
-      if (queue[id-1]){var newJob=JSON.parse(JSON.stringify(queue[id-1]))} // parse/stringify to deep copy and make sure we dont edit the original
-      if (newJob) {
-        newJob.number = 1
-        if (newJob.webhook){delete newJob.webhook}
-        return interaction.createModal({custom_id:'refreshEdit-'+newJob.id,title:'Edit the random prompt?',components:[{type:1,components:[{type:4,custom_id:'prompt',label:'Prompt',style:2,value:getRandom('prompt'),required:true}]}]}).then((r)=>{}).catch((e)=>{console.error(e)})
-      } else {
-        log('edit request failed'.bgRed)
-        return interaction.editParent({components:[]}).catch((e) => {console.error(e)})
-      }
-    } else if (interaction.data.custom_id.startsWith('edit-')) {
-      id=interaction.data.custom_id.split('-')[1]
-      if(queue[id-1]){var newJob=JSON.parse(JSON.stringify(queue[id-1]))}
+    } else if (cid.startsWith('editRandom-')) {
+      if(newJob){return interaction.createModal({custom_id:'refreshEdit-'+newJob.id,title:'Edit the random prompt?',components:[{type:1,components:[{type:4,custom_id:'prompt',label:'Prompt',style:2,value:getRandom('prompt'),required:true}]}]}).then((r)=>{}).catch((e)=>{console.error(e)})
+      }else{log('edit request failed'.bgRed);return clearParent(interaction)}
+    } else if (cid.startsWith('edit-')) {
       if(newJob){
-        newJob.number=1
-        if(newJob.webhook){delete newJob.webhook}
         return interaction.createModal({custom_id:'refreshEdit-'+newJob.id,title:'Edit the prompt',components:[{type:1,components:[{type:4,custom_id:'prompt',label:'Prompt',style:2,value:newJob.prompt,required:true}]}]}).then((r)=>{}).catch((e)=>{console.error(e)})
-      }else{
-        log('edit request failed'.bgRed)
-        return interaction.editParent({components:[]}).catch((e) => {console.error(e)})
-      }
-    } else if (interaction.data.custom_id.startsWith('editSteps-')) {
-      id=interaction.data.custom_id.split('-')[1];rn=interaction.data.custom_id.split('-')[2]
-      if(queue[id-1]){var newJob=JSON.parse(JSON.stringify(queue[id-1]))}
+      }else{log('edit request failed'.bgRed);return clearParent(interaction)}
+    } else if (cid.startsWith('editSteps-')) {
       if(newJob){
-        newJob.number=1
-        if(newJob.webhook){delete newJob.webhook}
         return interaction.createModal({custom_id:'twksteps-'+newJob.id,title:'Edit the steps (Max '+maxSteps+')',components:[{type:1,components:[{type:4,custom_id:'steps',label:'Steps',style:2,value:newJob.steps,required:true,min_length:1,max_length:3}]}]}).then((r)=>{}).catch((e)=>{console.error(e)})
-      }else{return interaction.editParent({components:[]}).catch((e) => {console.error(e)})}
-    } else if (interaction.data.custom_id.startsWith('editScale-')) {
-      id=interaction.data.custom_id.split('-')[1];rn=interaction.data.custom_id.split('-')[2]
-      if(queue[id-1]){var newJob=JSON.parse(JSON.stringify(queue[id-1]))}
+      }else{return clearParent(interaction)}
+    } else if (cid.startsWith('editScale-')) {
       if(newJob){
-        newJob.number=1
-        if(newJob.webhook){delete newJob.webhook}
         return interaction.createModal({custom_id:'twkscale-'+newJob.id,title:'Edit the scale',components:[{type:1,components:[{type:4,custom_id:'scale',label:'Scale',style:2,value:String(newJob.scale),required:true,min_length:1,max_length:4}]}]}).then((r)=>{}).catch((e)=>{console.error(e)})
-      }else{return interaction.editParent({components:[]}).catch((e) => {console.error(e)})}
-    } else if (interaction.data.custom_id.startsWith('tweak-')) {
-      id=interaction.data.custom_id.split('-')[1]
-      rn=interaction.data.custom_id.split('-')[2]
-      if(queue[id-1]){var newJob=JSON.parse(JSON.stringify(queue[id-1]))}
+      }else{return clearParent(interaction)}
+    } else if (cid.startsWith('editRotate-')) {
+      if(newJob){
+        msgid=cid.split('-')[3]
+        return interaction.createModal({custom_id:'twkrotate-'+id+'-'+rn+'-'+msgid,title:'Rotate the image',components:[{type:1,components:[{type:4,custom_id:'degrees',label:'Rotate this many degrees',style:2,value:90,required:true,min_length:1,max_length:3}]}]}).then((r)=>{}).catch((e)=>{console.error(e)})
+      }else{return clearParent(interaction)}
+    } else if (cid.startsWith('editStrength-')) {
+      if(newJob){
+        return interaction.createModal({custom_id:'twkstrength-'+newJob.id,title:'Edit the strength',components:[{type:1,components:[{type:4,custom_id:'strength',label:'Strength',style:2,value:String(newJob.strength),required:true,min_length:1,max_length:4}]}]}).then((r)=>{}).catch((e)=>{console.error(e)})
+      }else{return clearParent(interaction)}
+    } else if (cid.startsWith('editResolution-')) {
+      if(newJob){
+        return interaction.createModal({custom_id:'twkresolution-'+newJob.id,title:'Edit the resolution',components:[{type:1,components:[{type:4,custom_id:'resolution',label:'Resolution',style:2,value:String(newJob.width+'x'+newJob.height),required:true,min_length:5,max_length:12}]}]}).then((r)=>{}).catch((e)=>{console.error(e)})
+      }else{return clearParent(interaction)}
+    } else if (cid.startsWith('editText-')) {
+      msgid=cid.split('-')[3]
+      return interaction.createModal({custom_id:'twktext-'+id+'-'+rn+'-'+msgid,title:'Add text',components:[{type:1,components:[{type:4,custom_id:'twktext-'+id+'-'+rn+'-'+msgid,label:'Text to overlay on image',style:2,value:String(''),required:true,min_length:0,max_length:200}]}]}).then((r)=>{}).catch((e)=>{console.error(e)})
+    } else if (cid.startsWith('tweak-')) {
       if (newJob) {
-        newJob.number = 1
-        if (newJob.webhook){delete newJob.webhook}
         var tweakResponse=          {
             content:':test_tube: **Tweak Menu**',
             flags:64,
             components:[
               {type:Constants.ComponentTypes.ACTION_ROW,components:[
-                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.PRIMARY, label: "Portrait", custom_id: "twkaspectPortrait-"+id+'-'+rn, emoji: { name: '↕️', id: null}, disabled: false },
-                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.PRIMARY, label: "Square", custom_id: "twkaspectSquare-"+id+'-'+rn, emoji: { name: '🔳', id: null}, disabled: false },
-                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.PRIMARY, label: "Landscape", custom_id: "twkaspectLandscape-"+id+'-'+rn, emoji: { name: '↔️', id: null}, disabled: false },
-                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.SECONDARY, label: "Model", custom_id: "chooseModel-"+id+'-'+rn, emoji: { name: '💾', id: null}, disabled: false },
+                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.PRIMARY, label: "Aspect Ratio", custom_id: "chooseAspect-"+id+'-'+rn, emoji: { name: '📐', id: null}, disabled: false },
+                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.PRIMARY, label: "Model", custom_id: "chooseModel-"+id+'-'+rn, emoji: { name: '💾', id: null}, disabled: false },
+                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.PRIMARY, label: "Textual Inversions", custom_id: "chooseTi-"+id+'-'+rn, emoji: { name: '💊', id: null}, disabled: false },
+                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.PRIMARY, label: "Loras", custom_id: "chooseLora-"+id+'-'+rn, emoji: { name: '💊', id: null}, disabled: false }
+              ]},
+              {type:Constants.ComponentTypes.ACTION_ROW,components:[
+                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.SECONDARY, label: "Resolution", custom_id: "editResolution-"+id+'-'+rn, emoji: { name: '📏', id: null}, disabled: false },
+                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.SECONDARY, label: "Scale", custom_id: "editScale-"+id+'-'+rn, emoji: { name: '⚖️', id: null}, disabled: false },
+                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.SECONDARY, label: "Steps", custom_id: "editSteps-"+id+'-'+rn, emoji: { name: '♻️', id: null}, disabled: false },
+                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.SECONDARY, label: "Strength", custom_id: "editStrength-"+id+'-'+rn, emoji: { name: '💪', id: null}, disabled: false },
                 {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.SECONDARY, label: "Sampler", custom_id: "chooseSampler-"+id+'-'+rn, emoji: { name: '👁️', id: null}, disabled: false }
               ]},
               {type:Constants.ComponentTypes.ACTION_ROW,components:[
-                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.SECONDARY, label: "Scale", custom_id: "editScale-"+id+'-'+rn, emoji: { name: '⚖️', id: null}, disabled: false },
-                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.SECONDARY, label: "Steps", custom_id: "editSteps-"+id+'-'+rn, emoji: { name: '♻️', id: null}, disabled: false },
-                // {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.SECONDARY, label: "Embeds", custom_id: "chooseEmbeds-"+id+'-'+rn, emoji: { name: '💊', id: null}, disabled: false },
-                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.SECONDARY, label: "Textual Inversions", custom_id: "chooseTi-"+id+'-'+rn, emoji: { name: '💊', id: null}, disabled: false },
-                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.SECONDARY, label: "Loras", custom_id: "chooseLora-"+id+'-'+rn, emoji: { name: '💊', id: null}, disabled: false },
-              ]},
-              {type:Constants.ComponentTypes.ACTION_ROW,components:[
-                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.DANGER, label: "Upscale 2x", custom_id: "twkupscale2-"+id+'-'+rn, emoji: { name: '🔍', id: null}, disabled: false },
-                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.DANGER, label: "Upscale 4x", custom_id: "twkupscale4-"+id+'-'+rn, emoji: { name: '🔎', id: null}, disabled: false },
-                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.DANGER, label: "Face Fix GfpGAN", custom_id: "twkgfpgan-"+id+'-'+rn, emoji: { name: '💄', id: null}, disabled: false },
-                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.DANGER, label: "Face Fix CodeFormer", custom_id: "twkcodeformer-"+id+'-'+rn, emoji: { name: '💄', id: null}, disabled: false },
-                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.DANGER, label: "High Resolution Fix", custom_id: "twkhiresfix-"+id+'-'+rn, emoji: { name: '🔭', id: null}, disabled: false }
+                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.DANGER, label: "Upscale 2x", custom_id: "twkupscale2-"+id+'-'+rn, emoji: { name: '🔍', id: null}, disabled: newJob.upscale_level===0||false },
+                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.DANGER, label: "Upscale 4x", custom_id: "twkupscale4-"+id+'-'+rn, emoji: { name: '🔎', id: null}, disabled: newJob.upscale_level===0||false },
+                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.DANGER, label: "Face Fix GfpGAN", custom_id: "twkgfpgan-"+id+'-'+rn, emoji: { name: '💄', id: null}, disabled: newJob.gfpgan_strength!==0||false },
+                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.DANGER, label: "Face Fix CodeFormer", custom_id: "twkcodeformer-"+id+'-'+rn, emoji: { name: '💄', id: null}, disabled: newJob.codeformer_strength!==0||false },
+                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.DANGER, label: "High Resolution Fix", custom_id: "twkhiresfix-"+id+'-'+rn, emoji: { name: '🔭', id: null}, disabled: newJob.hires_fix||false }
               ]},
               {type:Constants.ComponentTypes.ACTION_ROW,components:[
                 {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.SECONDARY, label: "1% variant", custom_id: "twkvariant1-"+id+'-'+rn, emoji: { name: '🧬', id: null}, disabled: false },
@@ -1232,54 +1419,45 @@ bot.on("interactionCreate", async (interaction) => {
                 {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.SECONDARY, label: "Default settings", custom_id: "twkdefault-"+id+'-'+rn, emoji: { name: '☢️', id: null}, disabled: false },
                 {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.SECONDARY, label: "Fast settings", custom_id: "twkfast-"+id+'-'+rn, emoji: { name: '⏩', id: null}, disabled: false },
                 {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.SECONDARY, label: "Slow settings", custom_id: "twkslow-"+id+'-'+rn, emoji: { name: '⏳', id: null}, disabled: false },
-                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.SECONDARY, label: "Batch of 5", custom_id: "twkbatch5-"+id+'-'+rn, emoji: { name: '🖐️', id: null}, disabled: false }
+                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.SECONDARY, label: "Batch of 5", custom_id: "twkbatch5-"+id+'-'+rn, emoji: { name: '🖐️', id: null}, disabled: false },
+                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.PRIMARY, label: "More Options", custom_id: "tweakmore-"+id+'-'+rn+'-'+interaction.message.id, emoji: { name: '🚪', id: null}, disabled: false }
               ]}
             ]
           }
-          // Disable buttons depending on the current parameters
-          //if (newJob.width===512&&newJob.height===704){tweakResponse.components[0].components[0].disabled=true}
-          if (newJob.width===defaultSize&&newJob.height===(defaultSize+192)){tweakResponse.components[0].components[0].disabled=true}
-          if (newJob.width===newJob.height){tweakResponse.components[0].components[1].disabled=true}
-          //if (newJob.width===704&&newJob.height===512){tweakResponse.components[0].components[2].disabled=true}
-          if (newJob.height===defaultSize&&newJob.width===(defaultSize+192)){tweakResponse.components[0].components[2].disabled=true}
-          if (newJob.scale<=1){tweakResponse.components[1].components[0].disabled=true}
-          if (newJob.scale>=30){tweakResponse.components[1].components[1].disabled=true}
-          if (newJob.steps<=5){tweakResponse.components[1].components[2].disabled=true}
-          if (newJob.steps>=140){tweakResponse.components[1].components[3].disabled=true}
-          if (newJob.upscale_level!==0&&newJob.upscale_level!==''){tweakResponse.components[2].components[0].disabled=true;tweakResponse.components[2].components[1].disabled=true}
-          if (newJob.gfpgan_strength!==0){tweakResponse.components[2].components[2].disabled=true}
-          if (newJob.codeformer_strength!==0){tweakResponse.components[2].components[3].disabled=true}
-          if (newJob.hires_fix===true||(newJob.width*newJob.height)<300000){tweakResponse.components[2].components[4].disabled=true}
-          if (newJob.sampler==='k_euler_a'){tweakResponse.components[3].components[0].disabled=true}
-          if (newJob.sampler==='k_euler_a'){tweakResponse.components[3].components[1].disabled=true}
-          if (newJob.sampler==='k_euler_a'){tweakResponse.components[3].components[2].disabled=true}
-          if (newJob.sampler==='k_euler_a'){tweakResponse.components[3].components[3].disabled=true}
-          if (newJob.sampler==='k_euler_a'){tweakResponse.components[3].components[4].disabled=true}
         return interaction.createMessage(tweakResponse).then((r)=>{}).catch((e)=>{console.error(e)})
-      } else {
-        console.error('Edit request failed')
-        return interaction.editParent({components:[]}).catch((e) => {console.error(e)})
-      }
-    } else if (interaction.data.custom_id.startsWith('twk')) {
-      var jobId=interaction.data.custom_id.split('-')[1]
-      var newJob=JSON.parse(JSON.stringify(queue[jobId-1])) //copy job
-      var resultNumber=interaction.data.custom_id.split('-')[2]
-      var result=newJob.results[resultNumber] // The full settings output from api for previous result, ready for postprocessing
-      if(result&&result.metadata.image&&result.metadata.image.seed){debugLog('setting seed from batch result:'+result.metadata.image.seed);newJob.seed=result.metadata.image.seed}
-      newJob.results=[] // wipe results from old job
-      newJob.number=1 // Reset to single images
+      } else {console.error('Edit request failed');return clearParent(interaction)}
+    } else if (cid.startsWith('tweakmore-')) {
+      msgid=cid.split('-')[3]
+      if (newJob) {
+        var tweakResponse=          {
+            content:':door: **More Options**',
+            flags:64,
+            components:[
+              {type:Constants.ComponentTypes.ACTION_ROW,components:[
+                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.PRIMARY, label: "Remove Background", custom_id: "twkbackground-"+id+'-'+rn+'-'+msgid, emoji: { name: '🪄', id: null}, disabled: false },
+                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.PRIMARY, label: "Text Overlay", custom_id: "editText-"+id+'-'+rn+'-'+msgid, emoji: { name: '💬', id: null}, disabled: false },
+                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.PRIMARY, label: "Rotate", custom_id: "editRotate-"+id+'-'+rn+'-'+msgid, emoji: { name: '🔄', id: null}, disabled: false },
+                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.PRIMARY, label: "Expand Canvas", custom_id: "expand-"+id+'-'+rn, emoji: { name: '🪄', id: null}, disabled: true },
+                {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.PRIMARY, label: "Inpainting", custom_id: "inpaint-"+id+'-'+rn, emoji: { name: '🖌️', id: null}, disabled: true },
+              ]}
+            ]
+          }
+        return interaction.createMessage(tweakResponse).then((r)=>{}).catch((e)=>{console.error(e)})
+      } else {log('Edit request failed');return clearParent(interaction)}
+    } else if (cid.startsWith('twk')) {
+      try{await interaction.deferUpdate()}catch(err){log(err)}
       var newCmd=''
       var postProcess=false
-      switch(interaction.data.custom_id.split('-')[0].replace('twk','')){
+      switch(cid.split('-')[0].replace('twk','')){
         case 'scalePlus': newJob.scale=newJob.scale+1;break
         case 'scaleMinus': newJob.scale=newJob.scale-1;break
-        //case 'stepsPlus': newJob.steps=newJob.steps+10;break
-        //case 'stepsMinus': newJob.steps=newJob.steps-10;break
         case 'scale': var newscale=parseFloat(interaction.data.components[0].components[0].value);if(!isNaN(newscale)){newJob.scale=newscale};break
         case 'steps': var newsteps=parseInt(interaction.data.components[0].components[0].value);if(!isNaN(newsteps)){newJob.steps=newsteps};break
+        case 'strength': var newstrength=parseFloat(interaction.data.components[0].components[0].value);if(!isNaN(newstrength)){newJob.strength=newstrength};break
         case 'aspectPortrait': newJob.height=defaultSize+192;newJob.width=defaultSize;break
         case 'aspectLandscape': newJob.width=defaultSize+192;newJob.height=defaultSize;break
         case 'aspectSquare': newJob.width=defaultSize;newJob.height=defaultSize;break
+        case 'resolution': try{var newres=interaction.data.components[0].components[0].value.split('x');newJob.width=parseFloat(newres[0]);newJob.height=parseFloat(newres[1])}catch(err){log(err)};break
         case 'aspect4k': newJob.width=960;newJob.height=512;newJob.upscale_level=4;newJob.hires_fix=true;break
         case 'upscale2': newJob.upscale_level=2;break // currently resubmitting jobs, update to use postprocess once working
         case 'upscale4': newJob.upscale_level=4;break
@@ -1297,22 +1475,41 @@ bot.on("interactionCreate", async (interaction) => {
         case 'fast': newJob.steps=20;break
         case 'slow': newJob.steps=50;break
         case 'batch5': newJob.seed=getRandomSeed();newJob.number=5;break
+        case 'rotate': {
+          bot.getMessage(interaction.channel.id, interaction.data.custom_id.split('-')[3]).then((msg) => {
+            try{rotate(msg.attachments[0].proxy_url,parseInt(interaction.data.components[0].components[0].value),interaction.channel.id,interaction.member.id)}catch(err){log(err)}
+          }).catch((err) => { log(err)})
+          break
+        }
+        case 'background':{
+          var msgid=interaction.data.custom_id.split('-')[3]
+          var userid=interaction.member.id ? interaction.member.id : interaction.user.id
+          debugLog(userid)
+          debugLog(interaction)
+          bot.getMessage(interaction.channel.id, msgid).then((msg) => {
+            try{removeBackground(msg.attachments[0].proxy_url,interaction.channel.id,userid)}catch(err){log(err)}
+          }).catch((err) => { log(err)})
+          break}
+        case 'text':{
+          bot.getMessage(interaction.channel.id, interaction.data.custom_id.split('-')[3]).then((msg) => {textOverlay(msg.attachments[0].proxy_url,interaction.data.components[0].components[0].value,'south',interaction.channel.id,interaction.member.id)}).catch((err) => {log(err)})
+          break
+        }
       }
       if (postProcess){ // submit as postProcess request
         //todo
+      } else if (interaction.data.custom_id.startsWith('twkbackground')||interaction.data.custom_id.startsWith('twktext')||interaction.data.custom_id.startsWith('twkrotate')){
+        // dont submit as new job
       } else { // submit as new job with changes
-      if(newCmd===''){newCmd=getCmd(newJob)}
-      if (interaction.member) {
-        request({cmd: newCmd, userid: interaction.member.user.id, username: interaction.member.user.username, discriminator: interaction.member.user.discriminator, bot: interaction.member.user.bot, channelid: interaction.channel.id, attachments: newJob.attachments})
-      } else if (interaction.user){
-        request({cmd: newCmd, userid: interaction.user.id, username: interaction.user.username, discriminator: interaction.user.discriminator, bot: interaction.user.bot, channelid: interaction.channel.id, attachments: newJob.attachments})
+        if(newCmd===''){newCmd=getCmd(newJob)}
+        if (interaction.member) {
+          request({cmd: newCmd, userid: interaction.member.user.id, username: interaction.member.user.username, discriminator: interaction.member.user.discriminator, bot: interaction.member.user.bot, channelid: interaction.channel.id, attachments: newJob.attachments})
+        } else if (interaction.user){
+          request({cmd: newCmd, userid: interaction.user.id, username: interaction.user.username, discriminator: interaction.user.discriminator, bot: interaction.user.bot, channelid: interaction.channel.id, attachments: newJob.attachments})
+        }
       }
-      }
-      return interaction.editParent({content:':test_tube: **'+interaction.data.custom_id.split('-')[0].replace('twk','')+'** selected',components:[]}).catch((e) => {console.error(e)})
+      return clearParent(interaction)
+      //return interaction.editParent({content:':test_tube: **'+interaction.data.custom_id.split('-')[0].replace('twk','')+'** selected',components:[]}).catch(e=>{debugLog(e)})
     } else if (interaction.data.custom_id.startsWith('chooseModel')) {
-      id=interaction.data.custom_id.split('-')[1]
-      rn=interaction.data.custom_id.split('-')[2]
-      var newJob=JSON.parse(JSON.stringify(queue[id-1])) // parse/stringify to deep copy and make sure we dont edit the original
       if(newJob&&models){
         var changeModelResponse={content:':floppy_disk: **Model Menu**\nUse this menu to change the model/checkpoint being used, to give your image a specific style',flags:64,components:[]}
         var allModelKeys=Object.keys(models)
@@ -1325,11 +1522,6 @@ bot.on("interactionCreate", async (interaction) => {
         return interaction.editParent(changeModelResponse).then((r)=>{}).catch((e)=>{console.error(e)})
       }
     } else if (interaction.data.custom_id.startsWith('changeModel')) {
-      id=interaction.data.custom_id.split('-')[1]
-      rn=interaction.data.custom_id.split('-')[2]
-      var newJob=JSON.parse(JSON.stringify(queue[id-1])) // parse/stringify to deep copy and make sure we dont edit the original
-      var result=newJob.results[rn]
-      if(result){debugLog('setting seed from batch result:'+result.metadata.image.seed);newJob.seed=result.metadata.image.seed}
       var newModel=interaction.data.values[0]
       if (models[newModel]){
         var newModelDescription=models[newModel].description
@@ -1342,13 +1534,12 @@ bot.on("interactionCreate", async (interaction) => {
         newJob.model=newModel // set the new model
         if(newModelKeywords&&!newJob.prompt.includes(newModelKeywords)){ //new model needs keywords not currently in the prompt
           if(newJob.prompt.includes(oldModelKeywords)){ // old model needed keywords that are still in the prompt
-            newJob.prompt=newJob.prompt.replace(oldModelKeywords,newModelKeywords) // swap new for old
+            newJob.prompt=newJob.prompt.replaceAll(oldModelKeywords,newModelKeywords) // swap new for old
           }else{newJob.prompt=newModelKeywords+','+newJob.prompt}// otherwise, just add new keywords
         }
-        if (newJob.prompt.includes(oldModelKeywords)&&!newModelKeywords){newJob.prompt=newJob.prompt.replace(oldModelKeywords+',','')}//Remove old keywords, even if we dont have new ones to replace
+        if (newJob.prompt.includes(oldModelKeywords)&&!newModelKeywords){newJob.prompt=newJob.prompt.replaceAll(oldModelKeywords+',','')}//Remove old keywords, even if we dont have new ones to replace
         var attach=[]
         if (newJob.attachments.length>0){attach=newJob.attachments}
-        newJob.number=1
         if(interaction.member){
           request({cmd: getCmd(newJob), userid: interaction.member.user.id, username: interaction.member.user.username, discriminator: interaction.member.user.discriminator, bot: interaction.member.user.bot, channelid: interaction.channel.id, attachments: attach})
         } else if (interaction.user){
@@ -1357,20 +1548,12 @@ bot.on("interactionCreate", async (interaction) => {
         return interaction.editParent({content:':floppy_disk: ** Model '+interaction.data.values[0]+'** selected',components:[]}).catch((e) => {console.error(e)})
       }
     } else if (interaction.data.custom_id.startsWith('chooseSampler')) {
-      id=interaction.data.custom_id.split('-')[1]
-      rn=interaction.data.custom_id.split('-')[2]
-      var newJob=JSON.parse(JSON.stringify(queue[id-1]))
       if(newJob&&models){
         var changeSamplerResponse={content:':eye: **Sampler Menu**\nUse this menu to change the sampler being used',flags:64,components:[{type:Constants.ComponentTypes.ACTION_ROW,components:[{type: 3,custom_id:'changeSampler-'+id+'-'+rn,placeholder:'Choose a sampler',min_values:1,max_values:1,options:[]}]}]}
         samplers.forEach((s)=>{changeSamplerResponse.components[0].components[0].options.push({label: s,value: s})})
         return interaction.editParent(changeSamplerResponse).then((r)=>{}).catch((e)=>{console.error(e)})
       }
     } else if (interaction.data.custom_id.startsWith('changeSampler')) {
-      id=interaction.data.custom_id.split('-')[1]
-      rn=interaction.data.custom_id.split('-')[2]
-      var newJob=JSON.parse(JSON.stringify(queue[id-1]))
-      var result=newJob.results[rn]
-      if(result){debugLog('setting seed from batch result:'+result.metadata.image.seed);newJob.seed=result.metadata.image.seed}
       var newSampler=interaction.data.values[0]
       if(newJob&&newSampler){
         newJob.sampler=newSampler // set the new model
@@ -1382,9 +1565,6 @@ bot.on("interactionCreate", async (interaction) => {
         return interaction.editParent({content:':eye: ** Sampler '+interaction.data.values[0]+'** selected',components:[]}).catch((e) => {console.error(e)})
       }
     } else if (interaction.data.custom_id.startsWith('chooseEmbeds')) {
-      id=interaction.data.custom_id.split('-')[1]
-      rn=interaction.data.custom_id.split('-')[2]
-      var newJob=JSON.parse(JSON.stringify(queue[id-1])) // parse/stringify to deep copy and make sure we dont edit the original
       if(newJob&&lora&&ti){
         var changeEmbedResponse={content:':eye: **Embeds Menu**\n:pill: Embeddings are a way to supplement the current model with extra styles, characters or abilities.',flags:64,components:[]}
         debugLog('Loras: '+lora.length+'\nTextual Inversions: '+ti.length)
@@ -1399,9 +1579,6 @@ bot.on("interactionCreate", async (interaction) => {
         return interaction.editParent(changeEmbedResponse).then((r)=>{}).catch((e)=>{console.error(e)})
       }
     } else if (interaction.data.custom_id.startsWith('chooseTi')) {
-      id=interaction.data.custom_id.split('-')[1]
-      rn=interaction.data.custom_id.split('-')[2]
-      var newJob=JSON.parse(JSON.stringify(queue[id-1]))
       if(newJob&&lora&&ti){
         var changeEmbedResponse={content:':eye: **Textual Inversions Menu**\n:pill: Textual Inversions are a way to supplement the current model with extra styles, characters or abilities.',flags:64,components:[]}
         for(let i=0;i<ti.length;i+=25){
@@ -1411,9 +1588,6 @@ bot.on("interactionCreate", async (interaction) => {
         return interaction.editParent(changeEmbedResponse).then((r)=>{}).catch((e)=>{console.error(e)})
       }
     } else if (interaction.data.custom_id.startsWith('chooseLora')) {
-      id=interaction.data.custom_id.split('-')[1]
-      rn=interaction.data.custom_id.split('-')[2]
-      var newJob=JSON.parse(JSON.stringify(queue[id-1]))
       if(newJob&&lora&&ti){
         var changeEmbedResponse={content:':eye: **Lora Menu**\n:pill: Loras are a way to supplement the current model with extra styles, characters or abilities.',flags:64,components:[]}
         for(let i=0;i<lora.length;i+=25){
@@ -1423,11 +1597,6 @@ bot.on("interactionCreate", async (interaction) => {
         return interaction.editParent(changeEmbedResponse).then((r)=>{}).catch((e)=>{console.error(e)})
       }
     } else if (interaction.data.custom_id.startsWith('addLora')) {
-      id=interaction.data.custom_id.split('-')[1]
-      rn=interaction.data.custom_id.split('-')[2]
-      var newJob=JSON.parse(JSON.stringify(queue[id-1]))
-      var result=newJob.results[rn]
-      if(result){newJob.seed=result.metadata.image.seed}
       var newLora=interaction.data.values[0]
       if(newJob&&newLora){
         newJob.prompt+=' withLora('+newLora+',0.8)' // add lora to prompt
@@ -1439,14 +1608,10 @@ bot.on("interactionCreate", async (interaction) => {
         return interaction.editParent({content:':eye: ** LORA embed '+interaction.data.values[0]+'** selected',components:[]}).catch((e) => {console.error(e)})
       }
     } else if (interaction.data.custom_id.startsWith('addTi')) {
-      id=interaction.data.custom_id.split('-')[1]
-      rn=interaction.data.custom_id.split('-')[2]
-      var newJob=JSON.parse(JSON.stringify(queue[id-1]))
-      var result=newJob.results[rn]
-      if(result){newJob.seed=result.metadata.image.seed}
       var newTi=interaction.data.values[0]
       if(newJob&&newTi){
         newJob.prompt+=' \<'+newTi+'\>' // add ti to prompt
+        newJob.number=1
         if(interaction.member){
           request({cmd: getCmd(newJob), userid: interaction.member.user.id, username: interaction.member.user.username, discriminator: interaction.member.user.discriminator, bot: interaction.member.user.bot, channelid: interaction.channel.id, attachments: newJob.attachments})
         } else if (interaction.user){
@@ -1455,39 +1620,43 @@ bot.on("interactionCreate", async (interaction) => {
         return interaction.editParent({content:':eye: ** Textual inversion '+interaction.data.values[0]+'** selected',components:[]}).catch((e) => {console.error(e)})
       }
     } else if (interaction.data.custom_id.startsWith('chooseAspect')) {
-      id=interaction.data.custom_id.split('-')[1]
-      rn=interaction.data.custom_id.split('-')[2]
-      var newJob=JSON.parse(JSON.stringify(queue[id-1]))
-      var aspectRatios = ['1:1','3:4','4:3','9:5','5:9','9:16','16:9']
+      var aspectRatios = ['1:1','2:3','3:2','3:4','4:3','5:4','4:5','7:4','4:7','9:5','5:9','6:13','13:6','9:16','16:9','9:32','32:9']
       if(newJob){
         var changeAspectResponse={content:':eye: **Aspect Ratios**\n Different aspect ratios will give different compositions.',flags:64,components:[]}
-        //
-        for(let i=0;i<ti.length;i+=25){
-          changeAspectResponse.components.push({type:Constants.ComponentTypes.ACTION_ROW,components:[{type: 3,custom_id:'addAspect'+i+'-'+id+'-'+rn,placeholder:'Change aspect ratio',min_values:1,max_values:1,options:[]}]})
-          aspectRatios.forEach((i)=>{
-            var w=i.split(':')[0];var h=i.split(':')[1];var l
-            if (i='1:1'){l='square'}else if(w>h){l='landscape'}else{l='portrait'}
-            changeAspectResponse.components[changeAspectResponse.components.length-1].components[0].options.push({label: i,value: i,description: l})
+        var oldPixelCount=newJob.width*newJob.height
+        for(let i=0;i<aspectRatios.length;i+=25){
+          changeAspectResponse.components.push({type:Constants.ComponentTypes.ACTION_ROW,components:[{type: 3,custom_id:'addAspect'+i+'-'+id+'-'+rn,placeholder:'Change aspect ratio, keep pixel count',min_values:1,max_values:1,options:[]}]})
+          aspectRatios.forEach((a)=>{
+            var w=parseInt(a.split(':')[0]);var h=parseInt(a.split(':')[1]);var d;
+            var newWidth=Math.round(Math.sqrt(oldPixelCount * w / h))
+            var newHeight=Math.round(newWidth * h / w)
+            if (a==='1:1'){d='square'}else if(w>h){d='landscape'}else{d='portrait'}
+            changeAspectResponse.components[changeAspectResponse.components.length-1].components[0].options.push({label: a,value: a,description: d+' '+newWidth+'x'+newHeight})
           })
         }
-        return interaction.editParent(changeAspectResponse).then((r)=>{}).catch((e)=>{console.error(e)})
+        changeAspectResponse.components.push({type:Constants.ComponentTypes.ACTION_ROW,components:[
+          {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.SECONDARY, label: "Resolution", custom_id: "editResolution-"+id+'-'+rn, emoji: { name: '📏', id: null}, disabled: false },
+          {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.PRIMARY, label: "Portrait", custom_id: "twkaspectPortrait-"+id+'-'+rn, emoji: { name: '↕️', id: null}, disabled: newJob.height===(defaultSize+192)&&newJob.width===defaultSize||false },
+          {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.PRIMARY, label: "Square", custom_id: "twkaspectSquare-"+id+'-'+rn, emoji: { name: '🔳', id: null}, disabled: newJob.height===defaultSize&&newJob.width===defaultSize||false },
+          {type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.PRIMARY, label: "Landscape", custom_id: "twkaspectLandscape-"+id+'-'+rn, emoji: { name: '↔️', id: null}, disabled: newJob.height===defaultSize&&newJob.width===(defaultSize+192)||false }
+        ]})
+        //return clearParent(interaction)
+        return interaction.editParent(changeAspectResponse).then(()=>{}).catch((e)=>{debugLog(e)})
       }
     } else if (interaction.data.custom_id.startsWith('addAspect')) {
-      id=interaction.data.custom_id.split('-')[1]
-      rn=interaction.data.custom_id.split('-')[2]
-      var newJob=JSON.parse(JSON.stringify(queue[id-1]))
-      var result=newJob.results[rn]
-      if(result){newJob.seed=result.metadata.image.seed}
       var newAspect=interaction.data.values[0]
       if(newJob){
         var oldPixelCount=newJob.width*newJob.height
-        // Take aspect ratio
+        var newAspectWidth=newAspect.split(':')[0]
+        var newAspectHeight=newAspect.split(':')[1]
+        newJob.width=Math.round(Math.sqrt(oldPixelCount * newAspectWidth / newAspectHeight))
+        newJob.height=Math.round(newJob.width * newAspectHeight / newAspectWidth)
         if(interaction.member){
           request({cmd: getCmd(newJob), userid: interaction.member.user.id, username: interaction.member.user.username, discriminator: interaction.member.user.discriminator, bot: interaction.member.user.bot, channelid: interaction.channel.id, attachments: newJob.attachments})
         } else if (interaction.user){
           request({cmd: getCmd(newJob), userid: interaction.user.id, username: interaction.user.username, discriminator: interaction.user.discriminator, bot: interaction.user.bot, channelid: interaction.channel.id, attachments: newJob.attachments})
         }
-        return interaction.editParent({content:':eye: ** Textual inversion '+interaction.data.values[0]+'** selected',components:[]}).catch((e) => {console.error(e)})
+        return interaction.editParent({content:':eye: ** Aspect '+interaction.data.values[0]+'** selected',components:[]}).catch((e) => {console.error(e)})
       }
     }
   }
@@ -1500,32 +1669,67 @@ bot.on("interactionCreate", async (interaction) => {
 async function directMessageUser(id,msg,channel){ // try, fallback to channel
   d = await bot.getDMChannel(id).catch(() => {
     log('failed to get dm channel, sending public message instead')
-    if (channel&&channel.length>0){bot.createMessage(channel,msg).then(()=>{log('DM sent to '.dim+id)}).catch(() => log('failed to both dm a user or message in channel'.bgRed.white))}
+    if (channel&&channel.length>0){bot.createMessage(channel,msg).then(()=>{log('DM sent to '.dim+id)}).catch((err) => {log(err);log('failed to both dm a user or message in channel'.bgRed.white)})}
   })
   d.createMessage(msg).catch(() => {
-    if (channel&&channel.length>0){bot.createMessage(channel,msg).then(()=>{log('DM sent to '.dim+id)}).catch(() => log('failed to both dm a user or message in channel'.bgRed.white))}
+    if (channel&&channel.length>0){bot.createMessage(channel,msg).then(()=>{log('DM sent to '.dim+id)}).catch((err) => {log(err);log('failed to both dm a user or message in channel'.bgRed.white)})}
   })
 }
 
+async function sendToGalleryChannel(serverId, originalChannelId, messageId, msg) {
+  const galleryChannel = allGalleryChannels[serverId]
+  if (!galleryChannel) {log(`No gallery channel found for server ID: ${serverId}`);return}
+  const channel = await bot.getChannel(galleryChannel)
+  var alreadyInGallery=false
+  //if(channel.messages.length<50){debugLog('fetching gallery message history');await channel.getMessages({limit: 100})} // if theres less then 50 in the channel message cache, fetch 100
+  // await channel.getMessages({limit: 100})
+  const messageLink = `https://discord.com/channels/${serverId}/${originalChannelId}/${messageId}`
+  const components = [{ type: Constants.ComponentTypes.ACTION_ROW, components: [{ type: Constants.ComponentTypes.BUTTON, style: Constants.ButtonStyles.LINK, label: "Original message", url: messageLink, disabled: false }]}]
+  channel.messages.forEach(message=>{if(message.content===msg.content){alreadyInGallery=true;debugLog('found in gallery')}}) // look through eris message cache for channel for matching msg
+  if (!alreadyInGallery){
+    if (msg && msg.embeds && msg.embeds.length > 0) {
+      msg.embeds[0].description = ``
+      await channel.createMessage({ content: msg.content, embeds: msg.embeds, components: components }).catch(() => {log(`Failed to send message to the specified channel for server ID: ${serverId}`)})
+    } else {await channel.createMessage({ content: msg.content, components: components }).catch(() => {log(`Failed to send message to the specified channel for server ID: ${serverId}`)})}
+  } else {debugLog('Found identical existing star gallery message')}
+}
+
+async function moveToNSFWChannel(serverId, originalChannelId, messageId, msg) {
+  // similar to above, but transplant as-is and remove original
+  const nsfwChannel = allNSFWChannels[serverId]
+  debugLog(nsfwChannel)
+  if (!nsfwChannel) {log(`No nsfw channel found for server ID: ${serverId}`);return}
+  const channel = await bot.getChannel(nsfwChannel)
+  embeds = msg.embeds
+  content = msg.content
+  components = msg.components
+  debugLog(msg)
+  try{await channel.createMessage({ content: msg.content, components: components, embeds: embeds }).catch((err) => {debugLog(err);log(`Failed to move message to the NSFW channel for server ID: ${serverId}`)})}catch(err){log(err)}
+}
+
 bot.on("messageReactionAdd", async (msg,emoji,reactor) => {
-  if (msg.author){targetUserId=reactor.user.id}else{msg=await bot.getMessage(msg.channel.id,msg.id);targetUserId=reactor.id}
+  if (msg.author){targetUserId=reactor.user.id}else{
+    try{msg=await bot.getMessage(msg.channel.id,msg.id);targetUserId=reactor.id}catch(err){log(err)}
+  }
   var embeds=false
   if (msg.embeds){embeds=dJSON.parse(JSON.stringify(msg.embeds))}
   if (embeds&&msg.attachments&&msg.attachments.length>0) {embeds.unshift({image:{url:msg.attachments[0].url}})}
   if (msg.author&&msg.author.id===bot.application.id){
-    switch(emoji.name){
+  var reactorid = reactor.id ? reactor.id : reactor.user.id
+    switch(emoji.name){ // to use alongside starboard paste the following into starboard setup: star filters add content notmatch /^(?=.?:brain:.+?:straight_ruler:.+?:seedling:).$/
       case '😂':
       case '👍':
       case '⭐':
-      case '❤️': log('Positive emojis'.green+emoji.name); break
-      case '✉️': log('sending image to dm'.dim);directMessageUser(targetUserId,{content: msg.content, embeds: embeds});break // todo debug occasional error about reactor.user.id undefined here
-      case '🙈':
+      case '❤️': try{sendToGalleryChannel(msg.channel.guild.id, msg.channel.id, msg.id, { content: msg.content, embeds: embeds })}catch(err){};break
+      case '✉️': directMessageUser(targetUserId,{content: msg.content, embeds: embeds});break
+      case '🙈': if(msg.content.includes(reactorid)||reactorid===config.adminID){try{moveToNSFWChannel(msg.channel.guild.id, msg.channel.id, msg.id, { content: msg.content, embeds: embeds, attachments: msg.attachments, components: msg.components });msg.delete().catch(() => {})}catch(err){log(err)}};break
       case '👎':
       case '⚠️':
       case '❌':
       case '💩': {
         log('Negative emojis'.red+emoji.name.red)
-        if(msg.content.includes(reactor.user.id)||reactor.user.id===config.adminID){msg.delete().catch(() => {})}
+        try{if(msg.content.includes(reactorid)||reactorid===config.adminID){msg.delete().catch(() => {})}}catch(err){log(err)}
+        // todo try and delete the file from disk too
         break
       }
     }
@@ -1541,19 +1745,12 @@ bot.on("error", async (err) => {
  console.error(err)
  console.log(moment().format(), "--- END: ERROR ---")
 })
-//bot.on("channelCreate", (channel) => {log(channel)})
-//bot.on("channelDelete", (channel) => {log(channel)})
 bot.on("guildCreate", (guild) => {var m='joined new guild: '+guild.name;log(m.bgRed);directMessageUser(config.adminID,m)}) // todo send invite to admin
 bot.on("guildDelete", (guild) => {var m='left guild: '+guild.name;log(m.bgRed);directMessageUser(config.adminID,m)})
 bot.on("guildAvailable", (guild) => {var m='guild available: '+guild.name;log(m.bgRed)})
 bot.on("channelCreate", (channel) => {var m='channel created: '+channel.name+' in '+channel.guild.name;log(m.bgRed)})
 bot.on("channelDelete", (channel) => {var m='channel deleted: '+channel.name+' in '+channel.guild.name;log(m.bgRed)})
 bot.on("channelUpdate", (channel,oldChannel) => {var m='channel updated: '+channel.name+' in '+channel.guild.name;log(m.bgRed);if(channel.topic!==oldChannel.topic){log('new topic:'+channel.topic)}})
-bot.on("guildMemberAdd", (guild,member) => {var m='User '+member.username+'#'+member.discriminator+' joined guild '+guild.name;log(m.bgMagenta)})
-bot.on("guildMemberRemove", (guild,member) => {var m='User '+member.username+'#'+member.discriminator+' left guild '+guild.name;log(m.bgMagenta)})
-//bot.on("guildMemberUpdate", (guild,member,oldMember,communicationDisabledUntil) => {log('user updated'.bgRed); log(member)}) // todo fires on user edits, want to reward users that start boosting HQ server, oldMember.premiumSince=Timestamp since boosting guild
-//bot.on("channelRecipientAdd", (channel,user) => {log(channel,user)})
-//bot.on("channelRecipientRemove", (channel,user) => {log(channel,user)})
 var lastMsgChan=null
 bot.on("messageCreate", (msg) => {
   // an irc like view of non bot messages in allowed channels. Creepy but convenient
@@ -1572,10 +1769,9 @@ bot.on("messageCreate", (msg) => {
     msg.mentions.forEach((m)=>{
       if (m.id===bot.application.id){
         if (msg.referencedMessage===null){ // not a reply
-          log('arty mention replaced with !dream')
           msg.content = msg.content.replace('<@'+m.id+'>','').replace('!dream','')
           msg.content='!dream '+msg.content
-        } else if (msg.referencedMessage.author.id===bot.application.id) { // just a response to a message from arty, confirm before render
+        } else if (msg.referencedMessage.author.id===bot.application.id) { // a reply to a message from arty
           if (msg.referencedMessage.components && msg.referencedMessage.components[0] && msg.referencedMessage.components[0].components[0] && msg.referencedMessage.components[0].components[0].custom_id.startsWith('refresh-')) {
             var jobid = msg.referencedMessage.components[0].components[0].custom_id.split('-')[1]
             var newJob = JSON.parse(JSON.stringify(queue[jobid - 1]))
@@ -1598,16 +1794,8 @@ bot.on("messageCreate", (msg) => {
             var jobstring = newWidth + newHeight + newSteps + newSeed + newStrength + newScale + newSampler + newModel + newPerlin + newSeamless + newThreshold + newGfpgan_strength + newCodeformer_strength + newUpscale_level + newUpscale_strength
             // only works with normal renders - modified to change only mentioned parameters, otherwise use the same from referenced job
             msg.content = msg.content.replace('<@' + m.id + '>', '').replace('!dream', '')
-            if (msg.content.startsWith('+')) {
-              msg.content = '!dream ' + newJob.prompt + msg.content.substring(1, msg.content.length) +  jobstring
-            } else if (msg.content.startsWith('..')) {
+            if (msg.content.startsWith('..')) {
               msg.content = '!dream ' + newJob.prompt + jobstring + msg.content.substring(2, msg.content.length)
-            } else if (msg.content.startsWith('*')) {
-              var newnum = parseInt(msg.content.substring(1, 2))
-              msg.content = '!dream ' + jobstring + ' --number ' + newnum
-            } else if (msg.content.startsWith('-')) {
-              newJob.prompt = newJob.prompt.replace(msg.content.substring(1, msg.content.length), '')
-              msg.content = '!dream ' + newJob.prompt + jobstring
             } else if (msg.content.startsWith('info')) {
               var infostring = `!dream ` + newJob.prompt + newWidth + newHeight + newSteps + newSeed + newScale + newSampler + newModel
               infostring += newJob.strength !== 0.7 ? newStrength : ''
@@ -1623,13 +1811,12 @@ bot.on("messageCreate", (msg) => {
               bot.createMessage(msg.channel.id, { embed })
             } else if (msg.content.startsWith('seed')) {
               var embed = { title: '*Long press to copy the seed*', description: newSeed, color: getRandomColorDec() }
-              bot.createMessage(msg.channel.id, { embed })
+              try{bot.createMessage(msg.channel.id, { embed })}catch(err){log(err)}
             } else if (msg.content.startsWith('models')){
                 var modelsToTest=[]
                 var modelsToTestString=msg.content.substring(7)
                 var modelKeys=Object.keys(models)
                 if(modelsToTestString==='all'){modelsToTest=modelKeys}else{modelsToTestString.split(' ').forEach(m=>{if(modelKeys.includes(m)){modelsToTest.push(m)}})}
-                debugLog(modelsToTest.length*newJob.cost) // batch cost
                 modelsToTest.forEach(m=>{
                   newJob.model=m
                   request({cmd: getCmd(newJob), userid: msg.author.id, username: msg.author.username, discriminator: msg.author.discriminator, bot: msg.author.bot, channelid: msg.channel.id, attachments: msg.attachments})
@@ -1638,41 +1825,45 @@ bot.on("messageCreate", (msg) => {
                 var samplersToTest=[]
                 var samplersToTestString=msg.content.substring(7)
                 if(samplersToTestString==='all'){samplersToTest=samplers;debugLog(samplersToTest)}else{samplersToTestString.split(' ').forEach(s=>{if(samplers.includes(s)){samplersToTest.push(s)}})}
-                debugLog(samplers.length*newJob.cost) // batch cost
                 samplersToTest.forEach(s=>{
                   newJob.sampler=s
                   request({cmd: getCmd(newJob), userid: msg.author.id, username: msg.author.username, discriminator: msg.author.discriminator, bot: msg.author.bot, channelid: msg.channel.id, attachments: msg.attachments})
                 })
-            } else if (msg.content.startsWith('loras')){
-                var lorasToTest=[]
-                var lorasToTestString=msg.content.substring(6)
-                if(lorasToTestString==='all'){lorasToTest=lora;debugLog(lorasToTest)}else{lorasToTestString.split(' ').forEach(l=>{partialMatches(lora,l).forEach((m)=>{lorasToTest.push(m)})})}
-                var basePrompt=newJob.prompt
-                debugLog(lorasToTest)
-                lorasToTest.forEach(l=>{
-                  newJob.prompt=basePrompt+' withLora('+l+',0.8)'
-                  request({cmd: getCmd(newJob), userid: msg.author.id, username: msg.author.username, discriminator: msg.author.discriminator, bot: msg.author.bot, channelid: msg.channel.id, attachments: msg.attachments})
-                })
-            } else if (msg.content.startsWith('tis')){
-                var tisToTest=[]
-                var tisToTestString=msg.content.substring(4)
+            } else if (msg.content.startsWith('embeds')){
+                var tisToTest=[];var lorasToTest=[];var tisToTestString=msg.content.substring(7);var lorasToTestString=tisToTestString
                 if(tisToTestString==='all'){tisToTest=ti;debugLog(tisToTest)}else{tisToTestString.split(' ').forEach(t=>{
                   partialMatches(ti,t).forEach((m)=>{tisToTest.push(m)})
                 })}
+                if(lorasToTestString==='all'){lorasToTest=lora}else{lorasToTestString.split(' ').forEach(l=>{partialMatches(lora,l).forEach((m)=>{lorasToTest.push(m)})})}
                 var basePrompt=newJob.prompt
-                debugLog(tisToTest)
-                tisToTest.forEach(t=>{
-                  newJob.prompt=basePrompt+' <'+t+'>'
-                  request({cmd: getCmd(newJob), userid: msg.author.id, username: msg.author.username, discriminator: msg.author.discriminator, bot: msg.author.bot, channelid: msg.channel.id, attachments: msg.attachments})
-                })
+                var totalTests=tisToTest.length+lorasToTest.length
+                var newMsg='Testing '+totalTests+' embeddings total at a cost of '+totalTests*newJob.cost+' :coin: '
+                if (tisToTest.length>0){newMsg+='\nTextual inversions: '+tisToTest.join(' , ')}
+                if (lorasToTest.length>0){newMsg+='\nLORAs: '+lorasToTest.join(' , ')}
+                if (totalTests>0){
+                  sliceMsg(newMsg).forEach((m)=>{try{bot.createMessage(msg.channel.id, m)}catch(err){debugLog(err)}})
+                  tisToTest.forEach(t=>{
+                    newJob.prompt=basePrompt+' <'+t+'>'
+                    request({cmd: getCmd(newJob), userid: msg.author.id, username: msg.author.username, discriminator: msg.author.discriminator, bot: msg.author.bot, channelid: msg.channel.id, attachments: msg.attachments})
+                  })
+                  lorasToTest.forEach(l=>{
+                    newJob.prompt=basePrompt+' withLora('+l+',0.8)'
+                    request({cmd: getCmd(newJob), userid: msg.author.id, username: msg.author.username, discriminator: msg.author.discriminator, bot: msg.author.bot, channelid: msg.channel.id, attachments: msg.attachments})
+                  })
+                } else {try{bot.createMessage(msg.channel.id, 'No results found for your search, see `!embeds`')}catch(err){debugLog(err)}}
             }
           }
           if (msg.content.startsWith('template')&&msg.referencedMessage.attachments){
             msg.attachments=msg.referencedMessage.attachments
-            msg.content='!dream '+msg.content.substring(9) + ' ' + newModel + initSampler //use same model and DDIM sampler by default unless specified
-          } else if (msg.content.startsWith('inpaint')&&msg.referencedMessage.attachments){
+            var newDimensions=' --width '+msg.referencedMessage.attachments[0].width+' --height '+msg.referencedMessage.attachments[0].height
+            msg.content='!dream '+msg.content.substring(9)
+            if (!msg.content.includes('-- width')&&!msg.content.includes('--height')){msg.content+=newDimensions}
+          } else if (msg.content.startsWith('inpaint')&&msg.referencedMessage.attachments&&msg.referencedMessage.attachments[0]['content_type'].startsWith('image')){
             msg.attachments=msg.referencedMessage.attachments
-              msg.content='!dream '+msg.content.substring(7) + ' ' + '--model' + ' inpainting ' + initSampler //use inpaint model by default unless specified           
+            var newDimensions=' --width '+msg.referencedMessage.attachments[0].width+' --height '+msg.referencedMessage.attachments[0].height
+            msg.content='!dream '+msg.content.substring(7)
+            if(!msg.content.includes('-- model')){msg.content+=' --model '+defaultModelInpaint}
+            if (!msg.content.includes('-- width')&&!msg.content.includes('--height')){msg.content+=newDimensions}
           } else if (msg.content.startsWith('background')||msg.content.startsWith('!background')){
             msg.content='!background'
             msg.attachments=msg.referencedMessage.attachments
@@ -1691,6 +1882,9 @@ bot.on("messageCreate", (msg) => {
             if (msg.content[0]!=='!'){msg.content='!'+msg.content}
             msg.attachments=msg.referencedMessage.attachments
           } else if (msg.content.startsWith('text')||msg.content.startsWith('!text')){
+            msg.attachments=msg.referencedMessage.attachments
+          } else if (msg.content.startsWith('metadata')){
+            msg.content='!metadata'
             msg.attachments=msg.referencedMessage.attachments
           }
         }
@@ -1712,18 +1906,14 @@ bot.on("messageCreate", (msg) => {
     })
   }
   var c=msg.content.split(' ')[0]
-  if (msg.author.id!==bot.id&&authorised(msg,msg.channel.id,msg.guildID,)){ // Work anywhere its authorized // (msg.channel.id===config.channelID||!msg.guildID) // interaction.member,interaction.channel.id,interaction.guildID
+  if (msg.author.id!==bot.id&&authorised(msg,msg.channel.id,msg.guildID,)){ // Work anywhere its authorized
     switch(c){
-      case '!help':{bot.createMessage(msg.channel.id,'To create art type `!dream your idea here`\nSee these links for more info:\nhttps://peakd.com/@ausbitbank/our-new-stable-diffusion-discord-bot\nhttps://github.com/ausbitbank/stable-diffusion-discord-bot');break}
+      case '!help':{help(msg.channel.id);break}
       //case '!dream':{request({cmd: msg.content.substr(7, msg.content.length), userid: msg.author.id, username: msg.author.username, discriminator: msg.author.discriminator, bot: msg.author.bot, channelid: msg.channel.id, attachments: msg.attachments});break}
-      case '!prompt':
-      case '!random':{request({cmd: msg.content.substr(8,msg.content.length)+getRandom('prompt'), userid: msg.author.id, username: msg.author.username, discriminator: msg.author.discriminator, bot: msg.author.bot, channelid: msg.channel.id, attachments: msg.attachments});break}
       case '!recharge':rechargePrompt(msg.author.id,msg.channel.id);break
       case '!lexica':lexicaSearch(msg.content.substr(8, msg.content.length),msg.channel.id);break
       case '!meme':{
-        if (msg.content.startsWith('!meme lisapresentation')){
-          meme(msg.content.substr(6, msg.content.length),null,msg.author.id,msg.channel.id)
-        }else if (msg.attachments.length>0&&msg.attachments[0].content_type.startsWith('image/')){
+        if (msg.attachments.length>0&&msg.attachments[0].content_type.startsWith('image/')){
           meme(msg.content.substr(6, msg.content.length),msg.attachments.map((u)=>{return u.proxy_url}),msg.author.id,msg.channel.id)
         }else if (msg.referencedMessage){
           meme(msg.content.substr(6, msg.content.length),msg.referencedMessage.attachments.map((u)=>{return u.proxy_url}),msg.author.id,msg.channel.id)
@@ -1733,22 +1923,10 @@ bot.on("messageCreate", (msg) => {
         break
       }
       case '!avatar':{var avatars='';msg.mentions.forEach((m)=>{avatars+=m.avatarURL.replace('size=128','size=512')+'\n'});bot.createMessage(msg.channel.id,avatars);break}
-      case '!background':{ // requires docker run -p 127.0.0.1:5000:5000 danielgatis/rembg s
+      case '!background':{
         if (msg.attachments.length>0&&msg.attachments[0].content_type.startsWith('image/')){
           var attachmentsUrls = msg.attachments.map((u)=>{return u.proxy_url})
-          attachmentsUrls.forEach((url)=>{
-            log('Removing background from '+url)
-            axios.get(rembg+encodeURIComponent(url),{responseType: 'arraybuffer'})
-              .then((response)=>{
-                var newMsg='<@'+msg.author.id+'> used `!background`'
-                if (!creditsDisabled){
-                  chargeCredits(msg.author.id,0.05)
-                  newMsg+=', it cost :coin:`0.05`/`'+creditsRemaining(msg.author.id)+'`'
-                }
-                bot.createMessage(msg.channel.id, newMsg, {file: Buffer.from(response.data), name: 'bgremoved.png'})
-              })
-              .catch((err) => {var newMsg='unable to connect to rembg server\n`docker run -p 127.0.0.1:5000:5000 danielgatis/rembg s`';directMessageUser(config.adminID,newMsg);log(err,newMsg)})
-            })
+          attachmentsUrls.forEach((url)=>{removeBackground(url,msg.channel.id,msg.author.id)})
         }
         break
       }
@@ -1761,10 +1939,7 @@ bot.on("messageCreate", (msg) => {
               if(err){log('Error during cropping'.bgRed);log(err)}
               try{img.autocrop()}catch(err){debugLog(err)}
               var newMsg='<@'+msg.author.id+'> used `!crop`'
-              if(!creditsDisabled){
-                chargeCredits(msg.author.id,0.05)
-                newMsg+=', it cost :coin:`0.05`/`'+creditsRemaining(msg.author.id)+'`'
-              }
+              //if(!creditsDisabled){chargeCredits(msg.author.id,0.05);newMsg+=', it cost :coin:`0.05`/`'+creditsRemaining(msg.author.id)+'`'}
               img.getBuffer(jimp.MIME_PNG, (err,buffer)=>{
                 if(err){log(err)}
                 bot.createMessage(msg.channel.id, newMsg, {file: buffer, name: 'cropped.png'})
@@ -1800,10 +1975,7 @@ bot.on("messageCreate", (msg) => {
                 newImg.background(0x0).blit(img,x,y).getBuffer(jimp.MIME_PNG, (err,buffer)=>{
                   if(err){log(err)}
                   var newMsg = '<@'+msg.author.id+'> used `'+c+'`\nNew image size: '+newImg.bitmap.width+' x '+newImg.bitmap.height
-                  if (!creditsDisabled){
-                    chargeCredits(msg.author.id,0.05)
-                    newMsg+='\nIt cost :coin:`0.05`/`'+creditsRemaining(msg.author.id)+'`'
-                  }
+                  //if (!creditsDisabled){chargeCredits(msg.author.id,0.05);newMsg+='\nIt cost :coin:`0.05`/`'+creditsRemaining(msg.author.id)+'`'}
                   bot.createMessage(msg.channel.id, newMsg, {file: buffer, name: 'expand.png'})
                 })
               })
@@ -1845,7 +2017,7 @@ bot.on("messageCreate", (msg) => {
                   var newMsg='<@'+msg.author.id+'> used `'+c+'`'
                   if(!creditsDisabled){
                     chargeCredits(msg.author.id,0.05)
-                    newMsg+=', it cost :coin:`0.05`/`'+creditsRemaining(msg.author.id)
+                    newMsg+=', it cost :coin:`0.05`/`'+creditsRemaining(msg.author.id)+'`'
                   }
                   bot.createMessage(msg.channel.id, newMsg, {file: buffer, name: 'faded.png'})
               })
@@ -1902,46 +2074,39 @@ bot.on("messageCreate", (msg) => {
       }
       case '!textTop':
       case '!textBottom':
-      case '!textCenter':
+      case '!textCentre':
+      case '!textTopLeft':
+      case '!textTopRight':
+      case '!textBottomLeft':
+      case '!textBottomRight':
+      case '!textLeft':
+      case '!textRight':
       case '!text':{
         if (msg.attachments.length>0&&msg.attachments[0].content_type.startsWith('image/')){
           var attachmentsUrls = msg.attachments.map((u)=>{return u.proxy_url})
           attachmentsUrls.forEach((url)=>{
-            var newTxt=msg.content.substr(c.length+1)
-            log('adding text: '+newTxt)
-            jimp.read(url,(err,img)=>{
-              if(err){log('Error during text addition'.bgRed);log(err)}
-              var newMsg='<@'+msg.author.id+'> used `!text`'
-              if (!creditsDisabled){
-                chargeCredits(msg.author.id,0.05)
-                newMsg+=', it cost :coin:`0.05`/`'+creditsRemaining(msg.author.id)+'`'
-              }
-              jimp.loadFont(jimp.FONT_SANS_32_BLACK).then(font => {
-                //var newTxtWidth=jimp.measureText(jimp.FONT_SANS_32_BLACK, newTxt)
-                //var newTxtHeight=jimp.measureTextHeight(jimp.FONT_SANS_32_BLACK, newTxt, 100)
-                var txtObj={text:newTxt,alignmentX:jimp.HORIZONTAL_ALIGN_CENTER,alignmentY:jimp.VERTICAL_ALIGN_TOP,background:0xffffff}
-                switch(c){
-                  case '!text':
-                  case '!textCenter':{txtObj.alignmentY=jimp.VERTICAL_ALIGN_MIDDLE;break}
-                  case '!textTop':{txtObj.alignmentY=jimp.VERTICAL_ALIGN_TOP;break}
-                  case '!textBottom':{txtObj.alignmentY=jimp.VERTICAL_ALIGN_BOTTOM;break}
-                }
-                img.print(font, 0, 0, txtObj, img.bitmap.width, img.bitmap.height)
-                img.getBuffer(jimp.MIME_PNG, (err,buffer)=>{
-                  if(err){log(err)}
-                  try{bot.createMessage(msg.channel.id, newMsg, {file: buffer, name: 'text.png'})}catch(err){log(err)}
-                })
-              })
-            })
+            var newTxt=msg.content.substr(c.length+1); var gravity=''
+            switch(c){
+              case '!text':
+              case '!textBottom':{gravity='south';break}
+              case '!textBottomLeft':{gravity='southwest';break}
+              case '!textBottomRight':{gravity='southeast';break}
+              case '!textTop':{gravity='north';break}
+              case '!textTopLeft':{gravity='northwest';break}
+              case '!textTopRight':{gravity='northeast';break}
+              case '!textCentre':{gravity='centre';break}
+              case '!textLeft':{gravity='west';break}
+              case '!textRight':{gravity='east';break}
+            }
+            textOverlay(url,newTxt,gravity,msg.channel.id,msg.author.id)
           })
         }
         break
       }
       case '!models':{
-        if(!models){socket.emit('requestSystemConfig')}
+        /*if(!models){socket.emit('requestSystemConfig')}
         var newMsg=''
         if(models){
-          //debugLog(models)
           newMsg='**'+Object.keys(models).length+' models available**\n:green_circle: =loaded in VRAM :orange_circle: =cached in RAM :red_circle: = unloaded\n'
           Object.keys(models).forEach((m)=>{
             switch(models[m].status){
@@ -1954,8 +2119,8 @@ bot.on("messageCreate", (msg) => {
             if(newMsg.length>=1500){try{chatChan(msg.channel.id,newMsg);newMsg=''}catch(err){log(err)}}
           })
           if(newMsg!==''){try{chatChan(msg.channel.id,newMsg)}catch(err){log(err)}}
-        }
-        break
+        }*/
+        listModels(msg.channel.id);break
       }
       case '!imgdiff':{
         if (msg.attachments.length===2&&msg.attachments[0].content_type.startsWith('image/')&&msg.attachments[1].content_type.startsWith('image/')){
@@ -1974,38 +2139,28 @@ bot.on("messageCreate", (msg) => {
         }
         break
       }
-      case '!embeds':{
-        socket.emit("getLoraModels")
-        socket.emit("getTextualInversionTriggers")
-        newMsg=':pill: Embeddings are a way to supplement the current model. Add to prompt\n'
-        if(lora&&lora.length>0){newMsg+='**LORA**:\n'+lora.map(x=>`withLora(${x})`).join(' , ')+'\n'}
-        if(ti&&ti.length>0){newMsg=newMsg+'**Textual inversions**:\n'+ti.map(x=>`\<${x}\>`).join(' , ')+'\n Everything in https://huggingface.co/sd-concepts-library is also available'}
-        sliceMsg(newMsg).forEach((m)=>{try{bot.createMessage(msg.channel.id, m)}catch(err){debugLog(err)}})
-        break
-      }
-      case '!meta':{
+      case '!metadata':{
         if (msg.attachments.length===1&&msg.attachments[0].content_type.startsWith('image/')){
           var attachmentsUrls = msg.attachments.map((u)=>{return u.proxy_url})
-          jimp.read(attachmentsUrls[0], (err,img)=>{
-            if(err){debugLog(err)}
-            var newMsg = img.getMetadata()
-            debugLog(newMsg)
-            try{bot.createMessage(msg.channel.id, newMsg)}catch(err){debugLog(err)}
-          })
+          metaDataMsg(attachmentsUrls[0],msg.channel.id)
         }
+        break
+      }
+      case '!embeds':{
+        listEmbeds(msg.channel.id);break
       }
     }
   if (msg.author.id===config.adminID) { // admins only
     if (c.startsWith('!')){log('admin command: '.bgRed+c)}
     switch(c){
-      case '!dothething':{log(bot.users.get(msg.author.id).username);break}
       case '!wipequeue':{rendering=false;queue=[];dbWrite();log('admin wiped queue');break}
       case '!queue':{queueStatus();break}
       case '!cancel':{cancelRenders();break}
-      case '!pause':{bot.editStatus('dnd');paused=true;rendering=true;chat(':pause_button: Bot is paused, requests will still be accepted and queued for when I return');break}
+      case '!pause':{try{bot.editStatus('dnd')}catch(err){log(err)};paused=true;rendering=true;try{chat(':pause_button: Bot is paused, requests will still be accepted and queued for when I return')}catch(err){log(err)};break}
       case '!resume':{socket.emit('requestSystemConfig');paused=false;rendering=false;bot.editStatus('online');chat(':play_pause: Bot is back online');processQueue();break}
       case '!checkpayments':{checkNewPayments();break}
-      case '!restart':{log('Admin triggered bot on queue empty'.bgRed.white);exit(0)}
+      case '!repostfails':{repostFails();break}
+      case '!restart':{log('Admin triggered bot restart'.bgRed.white);exit(0)}
       case '!creditdisabled':{log('Credits have been disabled'.bgRed.white);creditsDisabled=true;bot.createMessage(msg.channel.id,'Credits have been disabled');break}
       case '!creditenabled':{log('Credits have been enabled'.bgRed.white);creditsDisabled=false;bot.createMessage(msg.channel.id,'Credits have been enabled');break}
       case '!credit':{
@@ -2030,25 +2185,20 @@ bot.on("messageCreate", (msg) => {
       }
       case '!guilds':{
         debugLog('Guild count: '+bot.guilds.size)
-        bot.guilds.forEach((g)=>{log({id: g.id, name: g.name, ownerID: g.ownerID, description: g.description, memberCount: g.memberCount})})
+        var guilds = bot.guilds//.sort((a, b) => a.memberCount - b.memberCount)
+        guilds.forEach((g)=>{log({id: g.id, name: g.name, ownerID: g.ownerID, description: g.description, memberCount: g.memberCount})})
         break
       }
-      case '!richlist':{getRichList();break}
       case '!leaveguild':{bot.leaveGuild(msg.content.split(' ')[1]);break}
       case '!getmessages':{var cid=msg.content.split(' ')[1];if(cid){bot.getMessages(cid).then(x=>{x.reverse();x.forEach((y)=>{log(y.author.username.bgBlue+': '+y.content);y.attachments.map((u)=>{return u.proxy_url}).forEach((a)=>{log(a)})})})};break}
       case '!updateslashcommands':{bot.getCommands().then(cmds=>{bot.commands = new Collection();for (const c of slashCommands) {bot.commands.set(c.name, c);bot.createCommand({name: c.name,description: c.description,options: c.options ?? [],type: Constants.ApplicationCommandTypes.CHAT_INPUT})}});break}
-      case '!deleteslashcommands':{bot.bulkEditCommands([]);bot.getCommands().then(cmds=>{bot.commands = new Collection();for (const c of slashCommands) {bot.commands.set(c.name, c);bot.createCommand({name: c.name,description: c.description,options: c.options ?? [],type: Constants.ApplicationCommandTypes.CHAT_INPUT})}});break}
+      case '!deleteslashcommands':{bot.bulkEditCommands([]);break}
       case '!randomisers':{
         var newMsg='**Currently loaded randomisers**\n'
         for (r in randoms){newMsg+='`{'+randoms[r]+'}`='+getRandom(randoms[r])+'\n'}
         if(newMsg.length<=2000){newMsg.length=1999} //max discord msg length of 2k
         //try{chatChan(msg.channel.id,newMsg)}catch(err){log(err)}
         sliceMsg(newMsg).forEach((m)=>{try{bot.createMessage(msg.channel.id, m)}catch(err){debugLog(err)}})
-        break
-      }
-      case '!schedule':{
-        if (msg.content.split(' ')[1]==='on'){dbScheduleRead()}
-        if (msg.content.split(' ')[1]==='off'){dbScheduleRead()}
         break
       }
     }
@@ -2061,7 +2211,7 @@ socket.on("generationResult", (data) => {generationResult(data)})
 socket.on("postprocessingResult", (data) => {postprocessingResult(data)})
 socket.on("initialImageUploaded", (data) => {debugLog('got init image uploaded');initialImageUploaded(data)})
 socket.on("imageUploaded", (data) => {debugLog('got image uploaded');initialImageUploaded(data)})
-socket.on("systemConfig", (data) => {debugLog('systemConfig received');currentModel=data.model_weights;models=data.model_list;debugLog(data)})
+socket.on("systemConfig", (data) => {debugLog('systemConfig received');currentModel=data.model_weights;models=data.model_list})
 socket.on("modelChanged", (data) => {currentModel=data.model_name;models=data.model_list;debugLog('modelChanged to '+currentModel)})
 var progressUpdate = {currentStep: 0,totalSteps: 0,currentIteration: 0,totalIterations: 0,currentStatus: 'Initializing',isProcessing: false,currentStatusHasSteps: true,hasError: false}
 socket.on("progressUpdate", (data) => {
@@ -2084,21 +2234,20 @@ socket.on("intermediateResult", (data) => {
   buf=new Buffer.from(data.url.replace(/^data:image\/\w+;base64,/, ''), 'base64')
   if(buf!==intermediateImagePrior){ // todo look at image difference % instead
     jimp.read(buf, (err,img)=>{
+      if(err){log(err)}
       side=Math.max(img.bitmap.width,img.bitmap.height)
       scale=Math.round(448/side)
-      //debugLog('width:'+img.bitmap.width+' height:'+img.bitmap.height+' side:'+side+' upscale:'+scale)
-      //img.scale(scale, jimp.RESIZE_BILINEAR) // better quality, slower
-      img.scale(scale, jimp.RESIZE_NEAREST_NEIGHBOR) // fastest but bad quality
+      img.scale(scale, jimp.RESIZE_NEAREST_NEIGHBOR) // RESIZE_NEAREST_NEIGHBOR fastest but bad quality // RESIZE_BILINEAR is better quality, slower
       img.getBuffer(img.getMIME(),(err,img2)=>{
         intermediateImage=img2
         intermediateImagePrior=buf
         if(!queueStatusLock){queueStatus()}
       })
     })
-  }else{debugLog('not upscaling cos same')}
+  }
 })
-socket.on("foundLoras", (answer) =>{lora=answer.map(item=>item.name);debugLog('Enabled LORAS:');debugLog(lora)})
-socket.on("foundTextualInversionTriggers", (answer) =>{ti=answer.local_triggers.map(item=>item.name).map(str => str.replace('<', '').replace('>', ''));debugLog('Enabled Textual Inversions');debugLog(ti)})
+socket.on("foundLoras", (answer) =>{lora=answer.map(item=>item.name)})
+socket.on("foundTextualInversionTriggers", (answer) =>{ti=answer.local_triggers.map(item=>item.name).map(str => str.replaceAll('<', '').replaceAll('>', ''))})
 socket.on('error', (error) => {
   log('Api socket error'.bgRed);log(error)
   var nowJob=queue[queue.findIndex((j)=>j.status==="rendering")]
